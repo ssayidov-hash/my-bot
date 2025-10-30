@@ -1,5 +1,5 @@
 ccxt
 pandas
 numpy
-python-telegram-bot==20.8
+python-telegram-bot>=21.0
 nest_asyncio
