@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 unified_futures_bot_ultra.py — RENDER.COM 100% РАБОЧИЙ
-MEXC + Bitget | 24/7 | v21+ | Кнопки | Трейлинг
+MEXC + Bitget | 24/7 | v21+ | Passphrase | IP Fix
 """
 
 import os
@@ -20,16 +20,17 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 )
 
-# ================== ENV VARS ==================
+# ================== ENV VARS (RENDER) ==================
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "0") or "0")
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")  # ← НОВОЕ
 
-if not all([TG_BOT_TOKEN, MEXC_API_KEY, BITGET_API_KEY]):
-    raise SystemExit("ОШИБКА: Добавьте TG_BOT_TOKEN, MEXC_API_KEY, BITGET_API_KEY в Environment Variables!")
+if not all([TG_BOT_TOKEN, MEXC_API_KEY, BITGET_API_KEY, BITGET_PASSPHRASE]):
+    raise SystemExit("ОШИБКА: Добавьте TG_BOT_TOKEN, MEXC_*, BITGET_*, BITGET_PASSPHRASE в Environment Variables!")
 
 # ================== НАСТРОЙКИ ==================
 TIMEFRAME = "15m"
@@ -132,6 +133,7 @@ def make_exchange(exchange_name):
         return ccxt.bitget({
             "apiKey": BITGET_API_KEY,
             "secret": BITGET_API_SECRET,
+            "password": BITGET_PASSPHRASE,  # ← PASSPHRASE
             "enableRateLimit": True,
             "options": {"defaultType": "swap"},
             "timeout": 30000,
@@ -184,7 +186,10 @@ async def scan_exchange(exchange_name: str):
             result = await process_symbol_with_retry(ex, s)
             entries.extend(result)
         except Exception as e:
-            log.warning(f"{exchange_name} {s}: {e}")
+            if "700006" in str(e):
+                log.warning(f"{exchange_name.upper()} IP не в белом списке. Добавь IP в API настройки.")
+            else:
+                log.warning(f"{exchange_name} {s}: {e}")
         await asyncio.sleep(0.6)
     entries.sort(key=lambda x: x[4], reverse=True)
     return entries
