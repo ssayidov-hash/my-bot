@@ -1,1 +1,1 @@
-worker: python unified_futures_bot_ultra.py
+worker: pip install . && python unified_futures_bot_ultra.py
