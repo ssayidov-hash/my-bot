@@ -266,7 +266,7 @@ async def process_symbol_with_retry(ex, s, max_retries=3):
 
 # ================== MAIN ==================
 async def main():
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TG_BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("scan", scan))
@@ -286,4 +286,5 @@ async def main():
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
+
     asyncio.get_event_loop().run_until_complete(main())
