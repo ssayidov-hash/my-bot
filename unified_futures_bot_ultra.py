@@ -5,6 +5,22 @@ MEXC + Bitget | 24/7 | x5 | сигналы по тренду | /scan | /top | /t
 """
 
 import os, asyncio, logging, time
+# === АНТИ-ДУБЛЬ ЗАЩИТА ПЕРЕД СТАРТОМ БОТА ===
+import requests, sys
+
+def ensure_single_instance(token: str):
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10)
+        data = resp.json()
+        if data.get("ok") and data.get("result", {}).get("url"):
+            print("⚠️ Duplicate instance detected — shutting down.", flush=True)
+            logging.error("⚠️ Duplicate instance detected — shutting down.")
+            sys.exit(0)
+    except Exception as e:
+        logging.warning(f"Webhook check failed: {e}")
+
+ensure_single_instance(os.getenv("TG_BOT_TOKEN", ""))
+# === КОНЕЦ АНТИ-ДУБЛЬ ===
 from datetime import datetime
 import datetime as dt
 from typing import Dict, List, Tuple, Any
