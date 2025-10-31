@@ -253,4 +253,102 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tag = signal_strength_tag(d["prob"])
         line = (
             f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {tag} ({d['prob']}%)\n"
-            f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f
+            f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин\n"
+        )
+        lines.append(line)
+        LAST_SCAN[chat_id].append((
+            d["symbol"], d["side"], d["exchange"],
+            d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
+            d["tp1_price"], d["tp2_price"], d["eta_min"], d["prob"], d["volr"], d["rsi"]
+        ))
+    await update.effective_message.reply_text("ТОП сигналы:\n" + "\n".join(lines))
+
+async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id; m = update.effective_message
+    if chat_id not in LAST_SCAN or not LAST_SCAN[chat_id]:
+        await m.reply_text("Сначала /scan или /top."); return
+    if len(context.args) < 2:
+        await m.reply_text("Формат: /trade <номер> <сумма>\nПример: /trade 2 40"); return
+    try:
+        idx = int(context.args[0]) - 1; stake = float(context.args[1])
+    except ValueError:
+        await m.reply_text("Номер и сумма должны быть числами."); return
+    rows = LAST_SCAN[chat_id]
+    if idx < 0 or idx >= len(rows): await m.reply_text("Нет такого номера."); return
+    sym, side, exname, entry, sl_pct, tp1_pct, tp2_pct, tp1_price, tp2_price, eta, prob, volr, rsi_val = rows[idx]
+    ex = make_exchange(exname)
+    try: bal = ex.fetch_balance(params={"type": "swap"})["USDT"]["free"]
+    except Exception as e: await m.reply_text(f"[{exname.upper()}] Баланс не получен: {e}"); return
+    amount = calc_position_amount(bal, entry, stake, LEVERAGE)
+    if amount <= 0: await m.reply_text("Недостаточно баланса."); return
+    set_leverage_isolated(ex, sym, LEVERAGE)
+    sl_price = entry*(1-sl_pct) if side=="long" else entry*(1+sl_pct)
+    trade = dict(symbol=sym, side=side, entry=entry, amount=amount, sl_price=sl_price, tp1_price=tp1_price, tp2_price=tp2_price)
+    try: place_orders(ex, trade)
+    except Exception as e: await m.reply_text(f"[{exname.upper()}] Ошибка ордеров: {e}"); log.error(e); return
+    ACTIVE_TRADES.setdefault(chat_id, []).append(dict(symbol=sym, side=side, entry=entry, amount=amount,
+        exchange=exname, tp1_price=tp1_price, tp2_price=tp2_price, sl_price=sl_price, time=datetime.now(dt.timezone.utc), stake=stake))
+    net_pct = estimate_net_profit_pct(tp1_pct)
+    await m.reply_text(
+        f"✅ [{exname.upper()}] {side.upper()} {sym}\n{signal_strength_tag(prob)} ({prob}%)\n"
+        f"Сумма: {stake} USDT (x{LEVERAGE}) → объём {amount:.4f}\nEntry: {entry:.6f}\n"
+        f"SL: {sl_price:.6f} (−{sl_pct*100:.1f}%)\nTP1: {tp1_price:.6f}\nTP2: {tp2_price:.6f}\n"
+        f"ETA: ~{eta} мин\n💰 Net +{net_pct*100:.2f}%"
+    )
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    trades = ACTIVE_TRADES.get(chat_id, [])
+    if not trades:
+        await update.effective_message.reply_text("Нет активных сделок."); return
+    lines = ["Активные сделки:"]
+    for i, t in enumerate(trades, 1):
+        lines.append(f"{i}. [{t['exchange'].upper()}] {t['side'].upper()} {t['symbol']} @ {t['entry']:.6f} | SL {t['sl_price']:.6f} | TP1 {t['tp1_price']:.6f}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_ENABLED
+    AUTO_ENABLED = False
+    await update.effective_message.reply_text("Автоскан отключён.")
+
+# ================== ФОН ==================
+async def auto_scan_loop(app):
+    global LAST_NO_SIGNAL_TIME
+    while True:
+        if AUTO_ENABLED:
+            try:
+                entries=await scan_all()
+                now=time.time()
+                if entries:
+                    LAST_NO_SIGNAL_TIME=now
+                    for chat in LAST_SCAN.keys():
+                        text=[f"📊 Автосигналы {datetime.utcnow().strftime('%H:%M:%S')} UTC:"]
+                        for i,d in enumerate(entries[:5],1):
+                            tag=signal_strength_tag(d["prob"])
+                            text.append(f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} {tag} ETA {d['eta_min']}м")
+                        await app.bot.send_message(chat, "\n".join(text))
+                else:
+                    if now-LAST_NO_SIGNAL_TIME>=NO_SIGNAL_NOTIFY_INTERVAL:
+                        for chat in LAST_SCAN.keys():
+                            await app.bot.send_message(chat, "Сигналов нет.")
+                        LAST_NO_SIGNAL_TIME=now
+                log.info("auto_scan tick OK")
+            except Exception as e: log.error(f"auto_scan_loop: {e}")
+        await asyncio.sleep(SCAN_INTERVAL)
+
+# ================== MAIN ==================
+async def main():
+    app=Application.builder().token(TG_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan_cmd))
+    app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("trade", trade_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    log.info("UNIFIED FUTURES BOT v23.1 FINAL STARTED")
+    print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7")
+    asyncio.create_task(auto_scan_loop(app))
+    await app.run_polling(drop_pending_updates=True)
+
+if __name__=="__main__":
+    asyncio.run(main())
