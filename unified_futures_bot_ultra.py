@@ -180,41 +180,77 @@ async def scan_all():
     m,b=await asyncio.gather(scan_exchange("mexc"),scan_exchange("bitget"))
     return m+b
 
-# ================== ТЕЛЕГРАМ ==================
-# (оставляем твои команды без изменений, как в предыдущем файле)
-# ================== ФОН И MAIN ==================
-async def auto_scan_loop(app):
-    global LAST_NO_SIGNAL_TIME
-    while True:
-        if AUTO_ENABLED:
-            try:
-                entries=await scan_all()
-                if not entries:
-                    log.info("auto_scan: no signals")
-                    LAST_NO_SIGNAL_TIME=time.time()
-                else:
-                    txt=[f"📊 Автосигналы {datetime.utcnow().strftime('%H:%M:%S')} UTC:"]
-                    for i,d in enumerate(entries[:10],1):
-                        tag=signal_strength_tag(d["prob"])
-                        txt.append(f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} {tag} ETA {d['eta_min']}м")
-                    for chat in LAST_SCAN.keys():
-                        await app.bot.send_message(chat, "\n".join(txt))
-                log.info("auto_scan tick OK")
-            except Exception as e:log.error(f"auto_scan_loop: {e}")
-        await asyncio.sleep(SCAN_INTERVAL)
+# ================== ТРЕЙДЫ ==================
+def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int):
+    try:
+        ex.set_leverage(lev, symbol, params={"marginMode": "isolated", "posMode": "one_way"})
+    except Exception as e:
+        log.warning(f"set_leverage {symbol}: {e}")
 
-async def main():
-    app=Application.builder().token(TG_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("top", top_cmd))
-    app.add_handler(CommandHandler("trade", trade_cmd))
-    app.add_handler(CommandHandler("report", report_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    log.info("UNIFIED FUTURES BOT v23.1 FINAL STARTED")
-    print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7")
-    asyncio.create_task(auto_scan_loop(app))
-    await app.run_polling(drop_pending_updates=True)
+def place_orders(ex: ccxt.Exchange, trade: Dict[str, Any]):
+    sym = trade["symbol"]
+    side = trade["side"]
+    entry = trade["entry"]
+    amount = trade["amount"]
+    sl_price = trade["sl_price"]
+    tp1_price = trade["tp1_price"]
+    tp2_price = trade["tp2_price"]
+    ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
+    a1 = amount * PARTIAL_TP_RATIO; a2 = amount - a1
+    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", a1, tp1_price, params={"reduceOnly": True})
+    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", a2, tp2_price, params={"reduceOnly": True})
+    ex.create_order(sym, "stop_market", "sell" if side == "long" else "buy", amount, params={"reduceOnly": True, "triggerPrice": sl_price})
 
-if __name__=="__main__":
-    asyncio.run(main())
+# ================== TELEGRAM ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "*UNIFIED FUTURES BOT v23.1 FINAL*\n\n"
+        f"⚙️ TF: {TIMEFRAME}\nАвтоскан: {SCAN_INTERVAL//60} мин\n"
+        f"Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f} M USDT\nRSI OB/OS: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+        f"EMA: {EMA_SHORT}/{EMA_LONG}\nSL base: {BASE_STOP_LOSS_PCT*100:.1f}% | x{LEVERAGE}\n\n"
+        "📋 Команды:\n/scan — поиск сигналов\n/top — топ-3\n"
+        "/trade <№> <сумма> — войти по сигналу\n/report — отчёт\n/stop — остановить авто"
+    )
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.effective_message.reply_text("Сканирую MEXC + Bitget…")
+    entries = await scan_all()
+    if not entries:
+        await update.effective_message.reply_text("Сигналов нет.")
+        LAST_SCAN[chat_id] = []
+        return
+    LAST_SCAN[chat_id] = []
+    lines = []
+    for i, d in enumerate(entries, 1):
+        tag = signal_strength_tag(d["prob"])
+        line = (
+            f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {tag} ({d['prob']}%)\n"
+            f"    RSI={d['rsi']:.1f} | vol×={d['volr']:.2f} | H1={d['h1']} H4={d['h4']}\n"
+            f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин\n"
+        )
+        lines.append(line)
+        LAST_SCAN[chat_id].append((
+            d["symbol"], d["side"], d["exchange"],
+            d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
+            d["tp1_price"], d["tp2_price"], d["eta_min"], d["prob"], d["volr"], d["rsi"]
+        ))
+        if i >= 15: break
+    await update.effective_message.reply_text("Сигналы:\n" + "\n".join(lines))
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    entries = await scan_all()
+    if not entries:
+        await update.effective_message.reply_text("Сигналов нет.")
+        return
+    strong = [d for d in entries if d["prob"] >= 80]
+    if not strong: strong = entries[:3]
+    lines = []
+    LAST_SCAN[chat_id] = []
+    for i, d in enumerate(strong[:3], 1):
+        tag = signal_strength_tag(d["prob"])
+        line = (
+            f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {tag} ({d['prob']}%)\n"
+            f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f
