@@ -337,12 +337,16 @@ async def auto_scan_loop(app):
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ================== MAIN ==================
-# ================== MAIN ==================
 import nest_asyncio
 nest_asyncio.apply()  # <-- критично для Render + Python 3.13
 
 async def main():
+    print("🚀 MAIN INIT START", flush=True)
+
     app = Application.builder().token(TG_BOT_TOKEN).build()
+    print("✅ Application initialized", flush=True)
+
+    # обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
@@ -351,19 +355,20 @@ async def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
 
     log.info("UNIFIED FUTURES BOT v23.1 FINAL STARTED")
-    print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7")
+    print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
 
-    # запускаем фоновый автоскан в действующем loop
+    # фоновая задача
     asyncio.create_task(auto_scan_loop(app))
 
-    # запускаем polling без попытки закрытия event loop
+    # правильный запуск без закрытия event loop
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    # держим процесс живым
-    await asyncio.Event().wait()
+    await asyncio.Event().wait()  # держим процесс живым
+
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
+
