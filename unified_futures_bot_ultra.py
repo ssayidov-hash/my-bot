@@ -190,7 +190,7 @@ def signal_strength_tag(prob: int) -> str:
         return "❄️ Слабый"
 
 # ================== СКАН ==================
-async def load_top_usdt_swaps(ex: ccxt.Exchange, top_n=60):
+def load_top_usdt_swaps(ex: ccxt.Exchange, top_n=60):
     ex.load_markets()
     tickers = ex.fetch_tickers()
     rows = []
