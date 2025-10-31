@@ -257,6 +257,18 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+
+    async def runner():
+        await main()
+
+    try:
+        # запускаем без закрытия loop — это устраняет проблему на Render
+        loop = asyncio.get_event_loop()
+        loop.create_task(runner())
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 
 
