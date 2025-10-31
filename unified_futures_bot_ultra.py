@@ -297,7 +297,7 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
 
 async def scan_exchange(name: str):
     ex = make_exchange(name)
-    syms = await asyncio.to_thread(load_top_usdt_swaps, ex, 60)
+    syms = await load_top_usdt_swaps(ex, 60)
     results = []
     for s in syms:
         try:
