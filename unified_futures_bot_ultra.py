@@ -528,6 +528,8 @@ async def auto_scan_loop(app):
         if AUTO_ENABLED:
             try:
                 entries = await scan_all()
+                if asyncio.iscoroutine(entries):
+                    entries = await entries
                 now = time.time()
                 if entries:
                     LAST_NO_SIGNAL_TIME = now
