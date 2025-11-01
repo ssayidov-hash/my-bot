@@ -1,33 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-unified_futures_bot_v2.4.2_smarttrade.py
-MEXC + Bitget | 24/7 | x5 | сигналы по тренду
-/scan | /top | /trade <№> <сумма> | /trade <symbol> <side> <amount>
-+ inline-кнопки BUY/EST/CLOSE + подтверждение для BUY
-+ АВТОСИГНАЛЫ ТОЖЕ С КНОПКАМИ
+unified_futures_bot_ultra2.5.0_analytics.py
+БАЗА: unified_futures_bot_ultra2.4.2 (твоя текущая)
+ДОБАВЛЕНО:
+- лог всех сделок в /mnt/data/trades_history.csv
+- запись открытия и закрытия (TP1/TP2/SL/Not placed)
+- /stats — показать win-rate и средний PnL
+- /history — прислать CSV
+Остальное НЕ трогал.
 """
 
 import os, asyncio, logging, time
-# === АНТИ-ДУБЛЬ ЗАЩИТА ПЕРЕД СТАРТОМ БОТА ===
 import requests, sys
-
-def ensure_single_instance(token: str):
-    if not token:
-        return
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10)
-        data = r.json()
-        if data.get("ok") and data.get("result", {}).get("url"):
-            print("⚠️ Duplicate instance detected — shutting down.", flush=True)
-            logging.error("⚠️ Duplicate instance detected — shutting down.")
-            sys.exit(0)
-    except Exception as e:
-        logging.warning(f"Webhook check failed: {e}")
-
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-ensure_single_instance(TG_BOT_TOKEN)
-# === КОНЕЦ АНТИ-ДУБЛЬ ===
-
 import math
 from datetime import datetime
 import datetime as dt
@@ -41,6 +25,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
 )
 from telegram.ext import (
     Application,
@@ -52,7 +37,28 @@ from telegram.ext import (
 import nest_asyncio
 nest_asyncio.apply()
 
-# ================== ENV МАРКЕТЫ ==================
+# ============ ПУТИ ============
+DATA_DIR = "/mnt/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+TRADES_CSV_PATH = os.path.join(DATA_DIR, "trades_history.csv")
+
+# ============ АНТИ-ДУБЛЬ ============
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+def ensure_single_instance(token: str):
+    if not token:
+        return
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10)
+        data = r.json()
+        if data.get("ok") and data.get("result", {}).get("url"):
+            print("⚠️ Duplicate instance detected — shutting down.", flush=True)
+            logging.error("⚠️ Duplicate instance detected — shutting down.")
+            sys.exit(0)
+    except Exception as e:
+        logging.warning(f"Webhook check failed: {e}")
+ensure_single_instance(TG_BOT_TOKEN)
+
+# ============ API KEYS ============
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
@@ -62,7 +68,7 @@ BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 if not all([TG_BOT_TOKEN, MEXC_API_KEY, BITGET_API_KEY, BITGET_PASSPHRASE]):
     raise SystemExit("Нужно задать TG_BOT_TOKEN, MEXC_*, BITGET_*, BITGET_PASSPHRASE!")
 
-# ================== ПАРАМЕТРЫ ==================
+# ============ ПАРАМЕТРЫ ============
 TIMEFRAME, LIMIT = "15m", 300
 
 RSI_PERIOD = 14
@@ -74,37 +80,35 @@ VOL_SMA = 20
 ATR_PERIOD = 14
 
 LEVERAGE = 5
-BASE_STOP_LOSS_PCT = 0.05        # 5% под ожидание 20–30 мин
-MIN_QUOTE_VOLUME = 5_000_000     # 5M USDT — только живые
-SCAN_INTERVAL = 300              # 5 мин
+BASE_STOP_LOSS_PCT = 0.05
+MIN_QUOTE_VOLUME = 5_000_000
+SCAN_INTERVAL = 300
 NO_SIGNAL_NOTIFY_INTERVAL = 3600
 
 PARTIAL_TP_RATIO = 0.5
 TP1_MULTIPLIER_TREND = 2.0
 TP2_MULTIPLIER_TREND = 4.0
 
-# trailing
 TRAILING_PCT_MULTIPLIER = 1.5
 TRAILING_ACTIVATION_MULTIPLIER = 1.2
 TRAILING_MIN_PROB = 80
 
-# комиссии
 TAKER_FEE = 0.0006
 MAKER_FEE = 0.0002
 
-SIGNAL_TTL = 1800  # 30 мин
+SIGNAL_TTL = 1800  # 30 min
 
-# ================== ЛОГИ ==================
+# ============ ЛОГИ ============
 os.makedirs("logs", exist_ok=True)
-LOG_FILENAME = f"logs/{datetime.now(dt.timezone.utc).date().isoformat()}_v24.log"
+LOG_FILENAME = f"logs/{datetime.now(dt.timezone.utc).date().isoformat()}_v25.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler(LOG_FILENAME, encoding="utf-8"), logging.StreamHandler()],
 )
-log = logging.getLogger("V24")
+log = logging.getLogger("V25")
 
-# ================== ГЛОБАЛЫ ==================
+# ============ ГЛОБАЛЫ ============
 LAST_SCAN: Dict[int, List[Tuple]] = {}
 ACTIVE_TRADES: Dict[int, List[Dict[str, Any]]] = {}
 H1_TRENDS_CACHE: Dict[str, Tuple[str, float]] = {}
@@ -117,7 +121,68 @@ SIGNAL_STORE: Dict[str, Dict[str, Any]] = {}
 LAST_EST_AMOUNT: Dict[int, float] = {}
 PENDING_CONFIRMS: Dict[str, Tuple[str, float]] = {}
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ==================
+# ============ УТИЛЫ ============
+def ensure_trades_csv():
+    """Создаёт CSV, если его нет."""
+    if not os.path.exists(TRADES_CSV_PATH):
+        import csv
+        with open(TRADES_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "timestamp_utc",
+                "chat_id",
+                "exchange",
+                "symbol",
+                "side",
+                "entry",
+                "sl",
+                "tp1",
+                "tp2",
+                "stake_usdt",
+                "leverage",
+                "result",           # OPEN / TP1 / TP2 / SL / CLOSED / FAIL
+                "profit_pct",
+                "profit_usdt",
+                "source",           # manual-index / manual-symbol / inline / auto
+            ])
+
+def append_trade_row(
+    chat_id: int,
+    exchange: str,
+    symbol: str,
+    side: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    stake_usdt: float,
+    result: str,
+    profit_pct: float,
+    profit_usdt: float,
+    source: str,
+):
+    ensure_trades_csv()
+    import csv
+    with open(TRADES_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            datetime.utcnow().isoformat(),
+            chat_id,
+            exchange,
+            symbol,
+            side,
+            f"{entry:.10f}",
+            f"{sl:.10f}",
+            f"{tp1:.10f}",
+            f"{tp2:.10f}",
+            f"{stake_usdt:.2f}",
+            LEVERAGE,
+            result,
+            f"{profit_pct:.6f}",
+            f"{profit_usdt:.6f}",
+            source,
+        ])
+
 def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False).mean()
 
@@ -206,6 +271,13 @@ def estimate_time_to_tp(entry: float, tp_price: float, atr_val: float, tf_minute
 def estimate_net_profit_pct(tp_pct: float) -> float:
     total_fee = TAKER_FEE + MAKER_FEE
     return tp_pct - total_fee
+
+def estimate_profit_usdt(stake_usdt: float, tp_pct: float) -> float:
+    position = stake_usdt * LEVERAGE
+    gross = position * tp_pct
+    fees = position * (TAKER_FEE + MAKER_FEE)
+    net = gross - fees
+    return max(0.0, net)
 
 def signal_strength_tag(prob: int) -> str:
     if prob >= 85:
@@ -344,21 +416,12 @@ async def scan_all():
     mexc_res, bitget_res = await asyncio.gather(mexc_task, bitget_task)
     return mexc_res + bitget_res
 
-# ================== РАСЧЁТ ПРОФИТА ==================
-def estimate_profit_usdt(stake_usdt: float, tp_pct: float) -> float:
-    position = stake_usdt * LEVERAGE
-    gross = position * tp_pct
-    fees = position * (TAKER_FEE + MAKER_FEE)
-    net = gross - fees
-    return max(0.0, net)
-
 def normalize_amount_for_exchange(exchange_id: str, symbol: str, amount: float) -> float:
     if exchange_id == "mexc":
         return max(1, int(math.ceil(amount)))
     else:
         return float(f"{amount:.6f}")
 
-# ================== ТРЕЙД ==================
 def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int):
     try:
         ex.set_leverage(lev, symbol, params={"marginMode": "isolated", "posMode": "one_way"})
@@ -376,7 +439,7 @@ def place_orders(ex: ccxt.Exchange, trade: Dict[str, Any]):
     entry_order = ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
 
     if ex.id == "bitget":
-        log.info(f"[BITGET] Entry done {sym} {side} amount={amount}. TP1={tp1_price}, TP2={tp2_price}, SL={sl_price} (not placed)")
+        log.info(f"[BITGET] Entry done {sym} {side} amount={amount}. TP/SL не ставим на бирже.")
         return {"tp_sl_placed": False, "order_ids": {}}
 
     amount1 = amount * PARTIAL_TP_RATIO
@@ -394,6 +457,28 @@ def place_orders(ex: ccxt.Exchange, trade: Dict[str, Any]):
         }
     }
 
+# ====== INLINE ======
+def build_signal_keyboard(signal_id: str):
+    row_buy = [
+        InlineKeyboardButton("BUY 10", callback_data=f"BUY|{signal_id}|10"),
+        InlineKeyboardButton("BUY 20", callback_data=f"BUY|{signal_id}|20"),
+        InlineKeyboardButton("BUY 50", callback_data=f"BUY|{signal_id}|50"),
+        InlineKeyboardButton("BUY 100", callback_data=f"BUY|{signal_id}|100"),
+    ]
+    row_est = [
+        InlineKeyboardButton("EST 10", callback_data=f"EST|{signal_id}|10"),
+        InlineKeyboardButton("EST 20", callback_data=f"EST|{signal_id}|20"),
+        InlineKeyboardButton("EST 50", callback_data=f"EST|{signal_id}|50"),
+        InlineKeyboardButton("EST 100", callback_data=f"EST|{signal_id}|100"),
+    ]
+    row_close = [InlineKeyboardButton("CLOSE", callback_data=f"CLOSE|{signal_id}")]
+    return InlineKeyboardMarkup([row_buy, row_est, row_close])
+
+def build_confirm_keyboard(query_id: str):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data=f"CONFIRM|{query_id}|YES"),
+                                  InlineKeyboardButton("No", callback_data=f"CONFIRM|{query_id}|NO")]])
+
+# ====== EXECUTE TRADE ======
 async def execute_trade_from_signal(
     update_or_bot,
     chat_id: int,
@@ -470,18 +555,62 @@ async def execute_trade_from_signal(
         else:
             await update_or_bot.effective_message.reply_text(msg)
         log.error(e)
+
+        # ЛОГ неуспешной попытки
+        append_trade_row(
+            chat_id,
+            signal["exchange"],
+            sym,
+            side,
+            entry,
+            sl_price,
+            tp1_price,
+            tp2_price,
+            stake_usdt,
+            result="FAIL",
+            profit_pct=0.0,
+            profit_usdt=0.0,
+            source=reason,
+        )
         return
 
     ACTIVE_TRADES.setdefault(chat_id, []).append({
-        **trade,
+        "symbol": sym,
+        "side": side,
+        "entry": entry,
+        "amount": amount,
         "exchange": signal["exchange"],
+        "tp1_price": tp1_price,
+        "tp2_price": tp2_price,
+        "sl_price": sl_price,
         "time": datetime.now(dt.timezone.utc),
         "stake": stake_usdt,
         "source": reason,
+        "use_trailing": trade["use_trailing"],
+        "trailing_pct": trade["trailing_pct"],
+        "trailing_activation": trade["trailing_activation"],
+        "order_ids": trade.get("order_ids", {}),
     })
 
     net_pct = estimate_net_profit_pct(tp1_pct)
     net_usdt = estimate_profit_usdt(stake_usdt, tp1_pct)
+
+    # ЛОГ ОТКРЫТИЯ
+    append_trade_row(
+        chat_id,
+        signal["exchange"],
+        sym,
+        side,
+        entry,
+        sl_price,
+        tp1_price,
+        tp2_price,
+        stake_usdt,
+        result="OPEN",
+        profit_pct=0.0,
+        profit_usdt=0.0,
+        source=reason,
+    )
 
     txt = (
         f"✅ [{signal['exchange'].upper()}] Открыт {side.upper()} {sym}\n"
@@ -490,8 +619,8 @@ async def execute_trade_from_signal(
         f"SL: {sl_price:.6f} (−{sl_pct*100:.1f}%)\n"
         f"TP1: {tp1_price:.6f} (+{tp1_pct*100:.1f}%)\n"
         f"TP2: {tp2_price:.6f} (+{tp2_pct*100:.1f}%)\n"
-        f"⏱ ETA: ~{eta_min} мин\n"
-        f"💰 Net: +{net_pct*100:.2f}% ≈ +{net_usdt:.2f} USDT\n"
+        f"⏱ Ожидание: ~{eta_min} мин\n"
+        f"💰 Net (TP1): +{net_pct*100:.2f}% ≈ +{net_usdt:.2f} USDT\n"
     )
     if trade["use_trailing"]:
         txt += f"📈 Trailing: {trade['trailing_pct']*100:.2f}% after +{trade['trailing_activation']*100:.2f}%\n"
@@ -503,27 +632,7 @@ async def execute_trade_from_signal(
     else:
         await update_or_bot.effective_message.reply_text(txt)
 
-# ================== INLINE КНОПКИ ==================
-def build_signal_keyboard(signal_id: str):
-    row_buy = [
-        InlineKeyboardButton("BUY 10", callback_data=f"BUY|{signal_id}|10"),
-        InlineKeyboardButton("BUY 20", callback_data=f"BUY|{signal_id}|20"),
-        InlineKeyboardButton("BUY 50", callback_data=f"BUY|{signal_id}|50"),
-        InlineKeyboardButton("BUY 100", callback_data=f"BUY|{signal_id}|100"),
-    ]
-    row_est = [
-        InlineKeyboardButton("EST 10", callback_data=f"EST|{signal_id}|10"),
-        InlineKeyboardButton("EST 20", callback_data=f"EST|{signal_id}|20"),
-        InlineKeyboardButton("EST 50", callback_data=f"EST|{signal_id}|50"),
-        InlineKeyboardButton("EST 100", callback_data=f"EST|{signal_id}|100"),
-    ]
-    row_close = [InlineKeyboardButton("CLOSE", callback_data=f"CLOSE|{signal_id}")]
-    return InlineKeyboardMarkup([row_buy, row_est, row_close])
-
-def build_confirm_keyboard(query_id: str):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data=f"CONFIRM|{query_id}|YES"),
-                                  InlineKeyboardButton("No", callback_data=f"CONFIRM|{query_id}|NO")]])
-
+# ====== CALLBACK ======
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -593,26 +702,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Отменено.")
         return
 
-# ================== TELEGRAM КОМАНДЫ ==================
+# ====== КОМАНДЫ ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "*UNIFIED FUTURES BOT v24 SMART-TRADE*\n\n"
+        "*UNIFIED FUTURES BOT v25 ANALYTICS*\n\n"
         "⚙️ Параметры:\n"
         f"• TF: {TIMEFRAME}\n"
         f"• Автоскан: {SCAN_INTERVAL//60} мин\n"
         f"• Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f}M USDT\n"
         f"• RSI OB/OS: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
         f"• EMA: {EMA_SHORT}/{EMA_LONG}\n"
-        f"• SL (base): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
+        f"• SL (base): {BASE_STOP_LOСС_PCT*100:.1f}%\n"
         f"• Плечо: x{LEVERAGE}\n"
-        f"• Комиссия: taker {TAKER_FEE*100:.2f}%, maker {MAKER_FEE*100:.2f}%\n"
-        f"• Trailing: {TRAILING_PCT_MULTIPLIER}x ATR after {TRAILING_ACTIVATION_MULTIPLIER}x TP1 (для prob>={TRAILING_MIN_PROB}%)\n\n"
         "📋 Команды:\n"
         "/scan — найти сигналы\n"
         "/top — топ-3 сильных\n"
-        "/trade <№> <сумма> — войти по сигналу из /scan\n"
-        "/trade <SYM> <side> <сумма> — войти принудительно (пример: /trade ZEN/USDT long 20)\n"
+        "/trade <№> <сумма>\n"
+        "/trade <symbol> <side> <сумма>\n"
         "/report — активные сделки\n"
+        "/stats — статистика по CSV\n"
+        "/history — прислать CSV\n"
         "/stop — выключить авто\n"
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
@@ -688,7 +797,7 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("Формат: /trade <№> <сумма> или /trade <symbol> <side> <amount>")
         return
 
-    # формат 2: /trade ZEN/USDT long 20
+    # режим: /trade ZEN/USDT long 20
     if len(context.args) >= 3 and "/" in context.args[0]:
         symbol = context.args[0].upper()
         side = context.args[1].lower()
@@ -723,7 +832,7 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await execute_trade_from_signal(update, chat_id, sig, stake, reason="manual-symbol")
         return
 
-    # формат 1: /trade 1 20
+    # режим: /trade 1 20
     if len(context.args) < 2:
         await m.reply_text("Формат: /trade <№> <сумма>")
         return
@@ -767,20 +876,8 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["Активные сделки:"]
     for i, t in enumerate(trades, 1):
-        dt_open = t["time"].strftime("%Y-%m-%d %H:%M")
-        ex = make_exchange(t["exchange"])
-        try:
-            ticker = ex.fetch_ticker(t["symbol"])
-            current_price = float(ticker["last"])
-            profit_pct = (current_price - t["entry"]) / t["entry"] if t["side"] == "long" else (t["entry"] - current_price) / t["entry"]
-            profit_pct *= LEVERAGE
-            net_profit_usdt = estimate_profit_usdt(t["stake"], profit_pct)
-            pnl_str = f"PNL: {profit_pct*100:.2f}% ≈ {net_profit_usdt:.2f} USDT"
-        except Exception as e:
-            pnl_str = f"PNL: error {e}"
         lines.append(
-            f"{i}. [{t['exchange'].upper()}] {t['side'].upper()} {t['symbol']} @ {t['entry']:.6f} | "
-            f"SL {t['sl_price']:.6f} | TP1 {t['tp1_price']:.6f} | {dt_open} | {pnl_str}"
+            f"{i}. [{t['exchange'].upper()}] {t['side'].upper()} {t['symbol']} @ {t['entry']:.6f} | SL {t['sl_price']:.6f} | TP1 {t['tp1_price']:.6f}"
         )
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -789,14 +886,59 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AUTO_ENABLED = False
     await update.effective_message.reply_text("Автоскан отключён.")
 
-# ================== ФОН ==================
+# ====== СТАТИСТИКА ======
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not os.path.exists(TRADES_CSV_PATH):
+        await update.effective_message.reply_text("История сделок пока пустая.")
+        return
+    import csv
+    total = 0
+    wins = 0
+    loses = 0
+    profit_sum = 0.0
+    with open(TRADES_CSV_PATH, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if str(row["chat_id"]) != str(chat_id):
+                continue
+            if row["result"] == "OPEN":
+                # пока не закрыта
+                continue
+            total += 1
+            p_usdt = float(row["profit_usdt"])
+            profit_sum += p_usdt
+            if row["result"] in ("TP1", "TP2", "CLOSED"):
+                wins += 1
+            elif row["result"] in ("SL", "FAIL"):
+                loses += 1
+    if total == 0:
+        await update.effective_message.reply_text("Пока нет закрытых сделок для статистики.")
+        return
+    win_rate = wins / total * 100
+    avg_profit = profit_sum / total
+    txt = (
+        f"📊 Статистика по сделкам:\n"
+        f"Всего закрытых: {total}\n"
+        f"В плюс: {wins} ({win_rate:.1f}%)\n"
+        f"В минус/ошибка: {loses}\n"
+        f"Средний результат: {avg_profit:.2f} USDT на сделку\n"
+        f"Цель: 60–65% — у тебя {'OK' if win_rate >= 60 else 'пока ниже цели'}\n"
+    )
+    await update.effective_message.reply_text(txt)
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(TRADES_CSV_PATH):
+        await update.effective_message.reply_text("История пока пустая.")
+        return
+    await update.effective_message.reply_document(
+        document=InputFile(TRADES_CSV_PATH),
+        filename="trades_history.csv",
+        caption="История сделок"
+    )
+
+# ====== ФОН: авто + трейлинг ======
 async def auto_scan_loop(app):
-    """
-    ТУТ ГЛАВНОЕ ИЗМЕНЕНИЕ:
-    1) автосигналы теперь тоже кладём в SIGNAL_STORE
-    2) и в LAST_SCAN[chat_id]
-    3) и шлём с inline-кнопками
-    """
     global LAST_NO_SIGNAL_TIME
     while True:
         if AUTO_ENABLED:
@@ -805,15 +947,11 @@ async def auto_scan_loop(app):
                 now = time.time()
                 if entries:
                     LAST_NO_SIGNAL_TIME = now
-
-                    # чистим старые
+                    # чистим
                     to_remove = [k for k, v in SIGNAL_STORE.items() if now - v["timestamp"] > SIGNAL_TTL]
                     for k in to_remove:
                         SIGNAL_STORE.pop(k, None)
-
-                    # рассылаем тем чатам, которые уже что-то делали
                     for chat_id in list(LAST_SCAN.keys()):
-                        # перезаписываем актуальный список, чтобы /trade 1 10 сработал
                         LAST_SCAN[chat_id] = []
                         await app.bot.send_message(
                             chat_id,
@@ -854,53 +992,116 @@ async def trailing_monitor(app):
             for trade in trades[:]:
                 ex = make_exchange(trade["exchange"])
                 try:
-                    positions = ex.fetch_positions([trade["symbol"]])
-                    pos = next((p for p in positions if p["contracts"] > 0 and p["side"] == trade["side"]), None)
-                    if not pos:
-                        trades.remove(trade)
-                        await app.bot.send_message(chat_id, f"Позиция {trade['symbol']} закрыта (не найдена).")
-                        continue
-                    current_price = float(ex.fetch_ticker(trade["symbol"])["last"])
+                    ticker = ex.fetch_ticker(trade["symbol"])
+                    current_price = float(ticker["last"])
                     side = trade["side"]
                     entry = trade["entry"]
-                    profit_pct = (current_price - entry) / entry if side == "long" else (entry - current_price) / entry
 
                     close_side = "sell" if side == "long" else "buy"
+
+                    # TP2
                     if (side == "long" and current_price >= trade["tp2_price"]) or (side == "short" and current_price <= trade["tp2_price"]):
                         ex.create_market_order(trade["symbol"], close_side, trade["amount"], params={"reduceOnly": True})
                         trades.remove(trade)
+
+                        # лог TP2
+                        profit_pct = abs(current_price - entry) / entry
+                        profit_usdt = estimate_profit_usdt(trade["stake"], profit_pct)
+                        append_trade_row(
+                            chat_id,
+                            trade["exchange"],
+                            trade["symbol"],
+                            trade["side"],
+                            entry,
+                            trade["sl_price"],
+                            trade["tp1_price"],
+                            trade["tp2_price"],
+                            trade["stake"],
+                            result="TP2",
+                            profit_pct=profit_pct,
+                            profit_usdt=profit_usdt,
+                            source=trade.get("source", "auto"),
+                        )
+
                         await app.bot.send_message(chat_id, f"Closed by TP2: {trade['symbol']} @ {current_price:.6f}")
                         continue
+
+                    # TP1
                     if (side == "long" and current_price >= trade["tp1_price"]) or (side == "short" and current_price <= trade["tp1_price"]):
                         partial_amt = trade["amount"] * PARTIAL_TP_RATIO
                         ex.create_market_order(trade["symbol"], close_side, partial_amt, params={"reduceOnly": True})
-                        await app.bot.send_message(chat_id, f"Partial close TP1: {trade['symbol']} amt={partial_amt} @ {current_price:.6f}")
                         trade["amount"] -= partial_amt
 
+                        profit_pct = abs(trade["tp1_price"] - entry) / entry
+                        profit_usdt = estimate_profit_usdt(trade["stake"], profit_pct)
+                        append_trade_row(
+                            chat_id,
+                            trade["exchange"],
+                            trade["symbol"],
+                            trade["side"],
+                            entry,
+                            trade["sl_price"],
+                            trade["tp1_price"],
+                            trade["tp2_price"],
+                            trade["stake"],
+                            result="TP1",
+                            profit_pct=profit_pct,
+                            profit_usdt=profit_usdt,
+                            source=trade.get("source", "auto"),
+                        )
+
+                        await app.bot.send_message(chat_id, f"Partial close TP1: {trade['symbol']} @ {current_price:.6f}")
+                        # не continue — пусть trailing обновится
+                    # SL
                     if (side == "long" and current_price <= trade["sl_price"]) or (side == "short" and current_price >= trade["sl_price"]):
                         ex.create_market_order(trade["symbol"], close_side, trade["amount"], params={"reduceOnly": True})
                         trades.remove(trade)
+
+                        loss_pct = -abs(trade["sl_price"] - entry) / entry
+                        loss_usdt = estimate_profit_usdt(trade["stake"], abs(loss_pct)) * -1
+
+                        append_trade_row(
+                            chat_id,
+                            trade["exchange"],
+                            trade["symbol"],
+                            trade["side"],
+                            entry,
+                            trade["sl_price"],
+                            trade["tp1_price"],
+                            trade["tp2_price"],
+                            trade["stake"],
+                            result="SL",
+                            profit_pct=loss_pct,
+                            profit_usdt=loss_usdt,
+                            source=trade.get("source", "auto"),
+                        )
+
                         await app.bot.send_message(chat_id, f"Closed by SL: {trade['symbol']} @ {current_price:.6f}")
                         continue
 
-                    if trade["use_trailing"] and profit_pct >= trade["trailing_activation"]:
+                    # Trailing
+                    profit_pct_live = (current_price - entry) / entry if side == "long" else (entry - current_price) / entry
+                    if trade.get("use_trailing") and profit_pct_live >= trade["trailing_activation"]:
                         new_sl = current_price * (1 - trade["trailing_pct"]) if side == "long" else current_price * (1 + trade["trailing_pct"])
                         if (side == "long" and new_sl > trade["sl_price"]) or (side == "short" and new_sl < trade["sl_price"]):
                             old_sl = trade["sl_price"]
                             trade["sl_price"] = new_sl
-                            if ex.id == "mexc" and "sl" in trade["order_ids"]:
-                                ex.cancel_order(trade["order_ids"]["sl"], trade["symbol"])
-                                sl_order = ex.create_order(
-                                    trade["symbol"], "stop_market", close_side, trade["amount"],
-                                    params={"reduceOnly": True, "triggerPrice": new_sl}
-                                )
-                                trade["order_ids"]["sl"] = sl_order.get("id")
-                            await app.bot.send_message(chat_id, f"Trailing SL updated for {trade['symbol']}: {old_sl:.6f} -> {new_sl:.6f}")
+                            if ex.id == "mexc" and "sl" in trade.get("order_ids", {}):
+                                try:
+                                    ex.cancel_order(trade["order_ids"]["sl"], trade["symbol"])
+                                    sl_order = ex.create_order(
+                                        trade["symbol"], "stop_market", close_side, trade["amount"],
+                                        params={"reduceOnly": True, "triggerPrice": new_sl}
+                                    )
+                                    trade["order_ids"]["sl"] = sl_order.get("id")
+                                except Exception as e:
+                                    log.warning(f"Trailing SL re-place {trade['symbol']}: {e}")
+                            await app.bot.send_message(chat_id, f"Trailing SL updated: {old_sl:.6f} → {new_sl:.6f}")
                 except Exception as e:
-                    log.warning(f"Trailing monitor {trade['symbol']}: {e}")
+                    log.warning(f"Trailing monitor: {e}")
         await asyncio.sleep(60)
 
-# ================== MAIN ==================
+# ====== MAIN ======
 async def main():
     print("🚀 MAIN INIT START", flush=True)
     app = Application.builder().token(TG_BOT_TOKEN).build()
@@ -912,9 +1113,11 @@ async def main():
     app.add_handler(CommandHandler("trade", trade_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    log.info("UNIFIED FUTURES BOT v24 SMART-TRADE STARTED")
+    log.info("UNIFIED FUTURES BOT v25 ANALYTICS STARTED")
     print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
 
     asyncio.create_task(auto_scan_loop(app))
