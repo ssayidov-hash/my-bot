@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-unified_futures_bot_ultra2.5.2.py
+unified_futures_bot_ultra2.5.1.py
 MEXC + Bitget | 24/7 | x5 | сигналы по тренду | /scan | /top | /trade <№> <сумма>
 с кнопками: EST 10/20/50/100 и BUY 10/20/50/100
 логирование сделок в ./data/trades_history.csv
