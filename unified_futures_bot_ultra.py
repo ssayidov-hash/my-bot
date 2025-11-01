@@ -3,7 +3,7 @@
 unified_futures_bot_v24_smarttrade.py
 MEXC + Bitget | 24/7 | x5 | сигналы по тренду
 /scan | /top | /trade <№> <сумма> | /trade <symbol> <side> <amount>
-+ inline-кнопки BUY/EST
++ inline-кнопки BUY/EST/CLOSE + подтверждение для BUY
 """
 
 import os, asyncio, logging, time
@@ -82,9 +82,16 @@ PARTIAL_TP_RATIO = 0.5
 TP1_MULTIPLIER_TREND = 2.0
 TP2_MULTIPLIER_TREND = 4.0
 
+# trailing
+TRAILING_PCT_MULTIPLIER = 1.5    # trailing_pct = ATR * 1.5 / close
+TRAILING_ACTIVATION_MULTIPLIER = 1.2  # activate after tp1_pct * 1.2
+TRAILING_MIN_PROB = 80           # use trailing only if prob >=80
+
 # комиссии (чуть с запасом)
 TAKER_FEE = 0.0006
 MAKER_FEE = 0.0002
+
+SIGNAL_TTL = 1800                # 30 мин для сигналов в SIGNAL_STORE
 
 # ================== ЛОГИ ==================
 os.makedirs("logs", exist_ok=True)
@@ -106,10 +113,12 @@ H1_TRENDS_CACHE: Dict[str, Tuple[str, float]] = {}
 H4_TRENDS_CACHE: Dict[str, Tuple[str, float]] = {}
 AUTO_ENABLED = True
 LAST_NO_SIGNAL_TIME = 0
-# для inline-кнопок: сигнал_id -> полный сигнал
+# для inline-кнопок: сигнал_id -> полный сигнал + timestamp
 SIGNAL_STORE: Dict[str, Dict[str, Any]] = {}
 # чат -> последняя оценка через EST
 LAST_EST_AMOUNT: Dict[int, float] = {}
+# для подтверждения: query_id -> (signal_id, amount)
+PENDING_CONFIRMS: Dict[str, Tuple[str, float]] = {}
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ==================
 def ema(s: pd.Series, p: int) -> pd.Series:
@@ -290,6 +299,9 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
 
     net_tp1_pct = estimate_net_profit_pct(tp1_pct)
 
+    trailing_pct = max(0.01, TRAILING_PCT_MULTIPLIER * atr_val / close)
+    trailing_activation = tp1_pct * TRAILING_ACTIVATION_MULTIPLIER
+
     return {
         "exchange": ex.id,
         "symbol": symbol,
@@ -310,6 +322,8 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
         "atr": float(atr_val),
         "note": "Near S" if nearS else "Near R" if nearR else "",
         "net_tp1_pct": net_tp1_pct,
+        "trailing_pct": trailing_pct,
+        "trailing_activation": trailing_activation,
     }
 
 async def scan_exchange(name: str):
@@ -367,20 +381,28 @@ def place_orders(ex: ccxt.Exchange, trade: Dict[str, Any]):
     tp2_price = trade["tp2_price"]
 
     # вход
-    ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
+    entry_order = ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
 
     if ex.id == "bitget":
         # на bitget не ставим tp/sl, только логируем
         log.info(f"[BITGET] Entry done {sym} {side} amount={amount}. TP1={tp1_price}, TP2={tp2_price}, SL={sl_price} (not placed)")
-        return {"tp_sl_placed": False}
+        return {"tp_sl_placed": False, "order_ids": {}}
 
     # для MEXC ставим как раньше
     amount1 = amount * PARTIAL_TP_RATIO
     amount2 = amount - amount1
-    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount1, tp1_price, params={"reduceOnly": True})
-    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount2, tp2_price, params={"reduceOnly": True})
-    ex.create_order(sym, "stop_market", "sell" if side == "long" else "buy", amount, params={"reduceOnly": True, "triggerPrice": sl_price})
-    return {"tp_sl_placed": True}
+    tp1_order = ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount1, tp1_price, params={"reduceOnly": True})
+    tp2_order = ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount2, tp2_price, params={"reduceOnly": True})
+    sl_order = ex.create_order(sym, "stop_market", "sell" if side == "long" else "buy", amount, params={"reduceOnly": True, "triggerPrice": sl_price})
+    return {
+        "tp_sl_placed": True,
+        "order_ids": {
+            "entry": entry_order.get("id"),
+            "tp1": tp1_order.get("id"),
+            "tp2": tp2_order.get("id"),
+            "sl": sl_order.get("id"),
+        }
+    }
 
 async def execute_trade_from_signal(
     update_or_bot,
@@ -444,10 +466,14 @@ async def execute_trade_from_signal(
         "sl_price": sl_price,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,
+        "use_trailing": signal["prob"] >= TRAILING_MIN_PROB,
+        "trailing_pct": signal.get("trailing_pct", 0.01),
+        "trailing_activation": signal.get("trailing_activation", 0.02),
     }
 
     try:
         res = place_orders(ex, trade)
+        trade["order_ids"] = res.get("order_ids", {})
     except Exception as e:
         msg = f"[{signal['exchange'].upper()}] Ошибка ордеров: {e}"
         if hasattr(update_or_bot, "send_message"):
@@ -459,14 +485,8 @@ async def execute_trade_from_signal(
 
     # записываем только если вход реально был
     ACTIVE_TRADES.setdefault(chat_id, []).append({
-        "symbol": sym,
-        "side": side,
-        "entry": entry,
-        "amount": amount,
+        **trade,
         "exchange": signal["exchange"],
-        "tp1_price": tp1_price,
-        "tp2_price": tp2_price,
-        "sl_price": sl_price,
         "time": datetime.now(dt.timezone.utc),
         "stake": stake_usdt,
         "source": reason,
@@ -485,6 +505,8 @@ async def execute_trade_from_signal(
         f"⏱ ETA: ~{eta_min} мин\n"
         f"💰 Net: +{net_pct*100:.2f}% ≈ +{net_usdt:.2f} USDT\n"
     )
+    if trade["use_trailing"]:
+        txt += f"📈 Trailing: {trade['trailing_pct']*100:.2f}% after +{trade['trailing_activation']*100:.2f}%\n"
     if signal["exchange"] == "bitget" and not res.get("tp_sl_placed", False):
         txt += "⚠️ Bitget: TP/SL не поставлены на бирже, фиксация — через бота.\n"
 
@@ -495,7 +517,7 @@ async def execute_trade_from_signal(
 
 # ================== INLINE КНОПКИ ==================
 def build_signal_keyboard(signal_id: str):
-    # две строки: BUY и EST
+    # две строки: BUY и EST + CLOSE
     row_buy = [
         InlineKeyboardButton("BUY 10", callback_data=f"BUY|{signal_id}|10"),
         InlineKeyboardButton("BUY 20", callback_data=f"BUY|{signal_id}|20"),
@@ -508,40 +530,84 @@ def build_signal_keyboard(signal_id: str):
         InlineKeyboardButton("EST 50", callback_data=f"EST|{signal_id}|50"),
         InlineKeyboardButton("EST 100", callback_data=f"EST|{signal_id}|100"),
     ]
-    return InlineKeyboardMarkup([row_buy, row_est])
+    row_close = [InlineKeyboardButton("CLOSE", callback_data=f"CLOSE|{signal_id}")]
+    return InlineKeyboardMarkup([row_buy, row_est, row_close])
+
+def build_confirm_keyboard(query_id: str):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes", callback_data=f"CONFIRM|{query_id}|YES"),
+        InlineKeyboardButton("No", callback_data=f"CONFIRM|{query_id}|NO"),
+    ]])
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data  # e.g. "BUY|<id>|10"
     parts = data.split("|")
-    if len(parts) != 3:
-        return
-    action, signal_id, amt_str = parts
     chat_id = query.message.chat_id
-    amount_usdt = float(amt_str)
 
-    signal = SIGNAL_STORE.get(signal_id)
-    if not signal:
-        await query.edit_message_text("Сигнал устарел. Сделай /scan.")
-        return
+    if len(parts) == 3:
+        action, signal_id, amt_str = parts
+        if action in ("BUY", "EST"):
+            try:
+                amount_usdt = float(amt_str)
+            except ValueError:
+                return
+        else:
+            amount_usdt = 0.0
 
-    if action == "EST":
-        # расчёт прибыли
-        tp1_pct = signal["tp1_pct"]
-        net_usdt = estimate_profit_usdt(amount_usdt, tp1_pct)
-        txt = (
-            f"📈 Оценка {signal['symbol']} {signal['side'].upper()} на {amount_usdt} USDT:\n"
-            f"TP1: +{tp1_pct*100:.2f}% → ≈ +{net_usdt:.2f} USDT (с комиссией)\n"
-            f"ETA: {signal['eta_min']} мин\n"
-        )
-        LAST_EST_AMOUNT[chat_id] = amount_usdt
-        await query.message.reply_text(txt)
-        return
+        signal_data = SIGNAL_STORE.get(signal_id)
+        if not signal_data or time.time() - signal_data["timestamp"] > SIGNAL_TTL:
+            await query.edit_message_text("Сигнал устарел. Сделай /scan.")
+            SIGNAL_STORE.pop(signal_id, None)
+            return
 
-    if action == "BUY":
-        # если до этого был EST — в принципе не важно, что жали раньше, как ты и сказал
-        await execute_trade_from_signal(context.bot, chat_id, signal, amount_usdt, reason="inline")
+        signal = signal_data["signal"]
+
+        if action == "EST":
+            # расчёт прибыли
+            tp1_pct = signal["tp1_pct"]
+            net_usdt = estimate_profit_usdt(amount_usdt, tp1_pct)
+            txt = (
+                f"📈 Оценка {signal['symbol']} {signal['side'].upper()} на {amount_usdt} USDT:\n"
+                f"TP1: +{tp1_pct*100:.2f}% → ≈ +{net_usdt:.2f} USDT (с комиссией)\n"
+                f"ETA: {signal['eta_min']} мин\n"
+            )
+            LAST_EST_AMOUNT[chat_id] = amount_usdt
+            await query.message.reply_text(txt)
+            return
+
+        if action == "BUY":
+            # шаг подтверждения
+            query_id = f"{chat_id}:{int(time.time())}"
+            PENDING_CONFIRMS[query_id] = (signal_id, amount_usdt)
+            txt = f"Подтверди BUY {amount_usdt} USDT для {signal['symbol']} {signal['side'].upper()}?"
+            await query.message.reply_text(txt, reply_markup=build_confirm_keyboard(query_id))
+            return
+
+        if action == "CLOSE":
+            await query.edit_message_reply_markup(None)
+            SIGNAL_STORE.pop(signal_id, None)
+            return
+
+    elif len(parts) == 3 and parts[0] == "CONFIRM":
+        _, query_id, choice = parts
+        pending = PENDING_CONFIRMS.pop(query_id, None)
+        if not pending:
+            await query.edit_message_text("Подтверждение устарело.")
+            return
+        signal_id, amount_usdt = pending
+        signal_data = SIGNAL_STORE.get(signal_id)
+        if not signal_data:
+            await query.edit_message_text("Сигнал устарел.")
+            return
+        signal = signal_data["signal"]
+
+        if choice == "YES":
+            await execute_trade_from_signal(context.bot, chat_id, signal, amount_usdt, reason="inline")
+            await query.edit_message_text("Подтверждено! Сделка открыта.")
+        else:
+            await query.edit_message_text("Отменено.")
         return
 
 # ================== TELEGRAM КОМАНДЫ ==================
@@ -556,7 +622,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• EMA: {EMA_SHORT}/{EMA_LONG}\n"
         f"• SL (base): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
         f"• Плечо: x{LEVERAGE}\n"
-        f"• Комиссия: taker {TAKER_FEE*100:.2f}%, maker {MAKER_FEE*100:.2f}%\n\n"
+        f"• Комиссия: taker {TAKER_FEE*100:.2f}%, maker {MAKER_FEE*100:.2f}%\n"
+        f"• Trailing: {TRAILING_PCT_MULTIPLIER}x ATR after {TRAILING_ACTIVATION_MULTIPLIER}x TP1 (для prob>={TRAILING_MIN_PROB}%)\n\n"
         "📋 Команды:\n"
         "/scan — найти сигналы\n"
         "/top — топ-3 сильных\n"
@@ -577,10 +644,15 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     LAST_SCAN[chat_id] = []
-    SIGNAL_STORE.clear()
+    # чистим старые сигналы
+    now = time.time()
+    to_remove = [k for k, v in SIGNAL_STORE.items() if now - v["timestamp"] > SIGNAL_TTL]
+    for k in to_remove:
+        del SIGNAL_STORE[k]
+
     for i, d in enumerate(entries, 1):
-        signal_id = f"{chat_id}:{i}:{int(time.time())}"
-        SIGNAL_STORE[signal_id] = d
+        signal_id = f"{chat_id}:{i}:{int(now)}"
+        SIGNAL_STORE[signal_id] = {"signal": d, "timestamp": now}
         LAST_SCAN[chat_id].append((
             d["symbol"], d["side"], d["exchange"],
             d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
@@ -606,10 +678,15 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not strong:
         strong = entries[:3]
     LAST_SCAN[chat_id] = []
-    SIGNAL_STORE.clear()
+    # чистим старые
+    now = time.time()
+    to_remove = [k for k, v in SIGNAL_STORE.items() if now - v["timestamp"] > SIGNAL_TTL]
+    for k in to_remove:
+        del SIGNAL_STORE[k]
+
     for i, d in enumerate(strong[:3], 1):
-        signal_id = f"{chat_id}:{i}:{int(time.time())}"
-        SIGNAL_STORE[signal_id] = d
+        signal_id = f"{chat_id}:{i}:{int(now)}"
+        SIGNAL_STORE[signal_id] = {"signal": d, "timestamp": now}
         LAST_SCAN[chat_id].append((
             d["symbol"], d["side"], d["exchange"],
             d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
@@ -646,7 +723,8 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # надо подтащить последнюю аналитику по этому символу
         # пробуем найти в SIGNAL_STORE
         sig = None
-        for s in SIGNAL_STORE.values():
+        for sd in SIGNAL_STORE.values():
+            s = sd["signal"]
             if s["symbol"].upper() == symbol and s["side"] == side:
                 sig = s
                 break
@@ -701,6 +779,8 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "prob": prob,
         "volr": volr,
         "rsi": rsi_val,
+        "trailing_pct": max(0.01, TRAILING_PCT_MULTIPLIER * (tp1_pct / TP1_MULTIPLIER_TREND)),  # approx ATR
+        "trailing_activation": tp1_pct * TRAILING_ACTIVATION_MULTIPLIER,
     }
     await execute_trade_from_signal(update, chat_id, sig, stake, reason="manual-index")
 
@@ -713,9 +793,19 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Активные сделки:"]
     for i, t in enumerate(trades, 1):
         dt_open = t["time"].strftime("%Y-%m-%d %H:%M")
+        ex = make_exchange(t["exchange"])
+        try:
+            ticker = ex.fetch_ticker(t["symbol"])
+            current_price = float(ticker["last"])
+            profit_pct = (current_price - t["entry"]) / t["entry"] if t["side"] == "long" else (t["entry"] - current_price) / t["entry"]
+            profit_pct *= LEVERAGE  # с плечом
+            net_profit_usdt = estimate_profit_usdt(t["stake"], profit_pct)
+            pnl_str = f"PNL: {profit_pct*100:.2f}% ≈ {net_profit_usdt:.2f} USDT"
+        except Exception as e:
+            pnl_str = f"PNL: error {e}"
         lines.append(
             f"{i}. [{t['exchange'].upper()}] {t['side'].upper()} {t['symbol']} @ {t['entry']:.6f} | "
-            f"SL {t['sl_price']:.6f} | TP1 {t['tp1_price']:.6f} | {dt_open}"
+            f"SL {t['sl_price']:.6f} | TP1 {t['tp1_price']:.6f} | {dt_open} | {pnl_str}"
         )
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -753,6 +843,63 @@ async def auto_scan_loop(app):
                 log.error(f"auto_scan_loop: {e}")
         await asyncio.sleep(SCAN_INTERVAL)
 
+async def trailing_monitor(app):
+    while True:
+        for chat_id, trades in ACTIVE_TRADES.items():
+            for trade in trades[:]:  # копия для удаления
+                ex = make_exchange(trade["exchange"])
+                try:
+                    positions = ex.fetch_positions([trade["symbol"]])
+                    pos = next((p for p in positions if p["contracts"] > 0 and p["side"] == trade["side"]), None)
+                    if not pos:
+                        trades.remove(trade)
+                        await app.bot.send_message(chat_id, f"Позиция {trade['symbol']} закрыта (не найдена).")
+                        continue
+                    current_price = float(ex.fetch_ticker(trade["symbol"])["last"])
+                    side = trade["side"]
+                    entry = trade["entry"]
+                    profit_pct = (current_price - entry) / entry if side == "long" else (entry - current_price) / entry
+
+                    # проверка на TP/SL для Bitget (или всех)
+                    close_side = "sell" if side == "long" else "buy"
+                    if (side == "long" and current_price >= trade["tp2_price"]) or (side == "short" and current_price <= trade["tp2_price"]):
+                        ex.create_market_order(trade["symbol"], close_side, trade["amount"], params={"reduceOnly": True})
+                        trades.remove(trade)
+                        await app.bot.send_message(chat_id, f"Closed by TP2: {trade['symbol']} @ {current_price:.6f}")
+                        continue
+                    if (side == "long" and current_price >= trade["tp1_price"]) or (side == "short" and current_price <= trade["tp1_price"]):
+                        # partial close для TP1
+                        partial_amt = trade["amount"] * PARTIAL_TP_RATIO
+                        ex.create_market_order(trade["symbol"], close_side, partial_amt, params={"reduceOnly": True})
+                        await app.bot.send_message(chat_id, f"Partial close TP1: {trade['symbol']} amt={partial_amt} @ {current_price:.6f}")
+                        trade["amount"] -= partial_amt  # update amount
+
+                    if (side == "long" and current_price <= trade["sl_price"]) or (side == "short" and current_price >= trade["sl_price"]):
+                        ex.create_market_order(trade["symbol"], close_side, trade["amount"], params={"reduceOnly": True})
+                        trades.remove(trade)
+                        await app.bot.send_message(chat_id, f"Closed by SL: {trade['symbol']} @ {current_price:.6f}")
+                        continue
+
+                    # trailing
+                    if trade["use_trailing"] and profit_pct >= trade["trailing_activation"]:
+                        new_sl = current_price * (1 - trade["trailing_pct"]) if side == "long" else current_price * (1 + trade["trailing_pct"])
+                        if (side == "long" and new_sl > trade["sl_price"]) or (side == "short" and new_sl < trade["sl_price"]):
+                            old_sl = trade["sl_price"]
+                            trade["sl_price"] = new_sl
+                            if ex.id == "mexc" and "sl" in trade["order_ids"]:
+                                # отменить старый SL
+                                ex.cancel_order(trade["order_ids"]["sl"], trade["symbol"])
+                                # новый SL
+                                sl_order = ex.create_order(
+                                    trade["symbol"], "stop_market", close_side, trade["amount"],
+                                    params={"reduceOnly": True, "triggerPrice": new_sl}
+                                )
+                                trade["order_ids"]["sl"] = sl_order.get("id")
+                            await app.bot.send_message(chat_id, f"Trailing SL updated for {trade['symbol']}: {old_sl:.6f} -> {new_sl:.6f}")
+                except Exception as e:
+                    log.warning(f"Trailing monitor {trade['symbol']}: {e}")
+        await asyncio.sleep(60)  # каждую минуту
+
 # ================== MAIN ==================
 async def main():
     print("🚀 MAIN INIT START", flush=True)
@@ -771,6 +918,7 @@ async def main():
     print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
 
     asyncio.create_task(auto_scan_loop(app))
+    asyncio.create_task(trailing_monitor(app))
 
     await app.initialize()
     await app.start()
