@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-unified_futures_bot_v24_smarttrade.py
+unified_futures_bot_v2.4.2_smarttrade.py
 MEXC + Bitget | 24/7 | x5 | сигналы по тренду
 /scan | /top | /trade <№> <сумма> | /trade <symbol> <side> <amount>
 + inline-кнопки BUY/EST/CLOSE + подтверждение для BUY
