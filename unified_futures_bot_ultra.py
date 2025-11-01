@@ -508,21 +508,35 @@ def build_signal_keyboard(idx: int) -> InlineKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "*UNIFIED FUTURES BOT v2.5.1*\n\n"
-        "⚙️ Параметры:\n"
-        f"• TF: {TIMEFRAME}\n"
-        f"• Автоскан: {SCAN_INTERVAL//60} мин\n"
+        "*🤖 UNIFIED FUTURES BOT v2.5.1 PRO*\n\n"
+        "⚙️ *Параметры стратегии:*\n"
+        f"• Таймфрейм: {TIMEFRAME}\n"
+        f"• Автоскан: каждые {SCAN_INTERVAL//60} мин\n"
         f"• Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f}M USDT\n"
-        f"• SL (base): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
+        f"• RSI OB/OS: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+        f"• EMA: {EMA_SHORT}/{EMA_LONG}\n"
+        f"• SL (базовый): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
         f"• Плечо: x{LEVERAGE}\n"
-        f"• Trailing: активируется с +{TRAILING_ACTIVATION_PCT*100:.1f}%, дистанция {TRAILING_DISTANCE_PCT*100:.1f}%\n\n"
-        "📋 Команды:\n"
+        f"• Trailing: активируется с +{TRAILING_ACTIVATION_PCT*100:.1f}%, дистанция {TRAILING_DISTANCE_PCT*100:.1f}%\n"
+        f"• Комиссия (вход+выход): {(TAKER_FEE+MAKER_FEE)*100:.2f}%\n"
+        f"• TP1/TP2 множители ATR: {TP1_MULTIPLIER_TREND}/{TP2_MULTIPLIER_TREND}\n"
+        f"• Min ETA: 15m candle-based estimation\n\n"
+
+        "📋 *Команды:*\n"
         "/scan — найти сигналы\n"
         "/top — топ-3 сильных\n"
         "/trade <№> <сумма> — войти по сигналу\n"
         "/report — активные сделки\n"
-        "/history — файл сделок\n"
-        "/stop — выключить авто\n"
+        "/history — файл всех сделок (лог)\n"
+        "/stop — выключить автоскан\n\n"
+
+        "💡 *Советы:*\n"
+        "• Используй 🔥 сигналы с prob ≥ 80%\n"
+        "• Лучше входить в сторону тренда (H1/H4 совпадают)\n"
+        "• Перед реальной торговлей протестируй EST-кнопки\n"
+        "• Трейлинг фиксирует прибыль при развороте цены\n\n"
+
+        "🚀 Бот готов к работе! Используй /scan чтобы начать поиск сигналов."
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
