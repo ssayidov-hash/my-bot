@@ -414,12 +414,27 @@ def append_trade_row(row: dict):
 init_trades_csv()
 
 # ================== ТРЕЙДЫ ==================
-def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int):
-    # пробуем выставить isolated
+def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int, side: str = "long"):
     try:
-        ex.set_leverage(lev, symbol, params={"marginMode": "isolated", "posMode": "one_way"})
+        if ex.id == "mexc":
+            ex.set_leverage(
+                lev, symbol,
+                params={
+                    "openType": 1,  # 1 = isolated, 2 = cross
+                    "positionType": 1 if side == "long" else 2,  # 1 long / 2 short
+                }
+            )
+        else:
+            ex.set_leverage(
+                lev, symbol,
+                params={
+                    "marginMode": "isolated",
+                    "posMode": "one_way",
+                }
+            )
     except Exception as e:
         log.warning(f"set_leverage {symbol}: {e}")
+
 
 def is_isolated_mode_on_bitget(ex: ccxt.Exchange, symbol: str) -> bool:
     try:
@@ -681,20 +696,29 @@ async def execute_trade_from_signal(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Не смог получить баланс: {e}")
         return
+amount = calc_position_amount(bal, entry, stake, LEVERAGE)
+amount = normalize_amount_for_exchange(ex, sym, amount)
+if amount <= 0:
+    await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Слишком маленькая сумма для {sym}")
+    return
 
-    amount = calc_position_amount(bal, entry, stake, LEVERAGE)
-    amount = normalize_amount_for_exchange(ex, sym, amount)
-    if amount <= 0:
-        await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Слишком маленькая сумма для {sym}")
+# проверка isolated (особенно для bitget)
+if d["exchange"] == "bitget":
+    if not is_isolated_mode_on_bitget(ex, sym):
+        await context.bot.send_message(chat_id, "⚠️ Bitget сейчас в CROSS/CRUZADO. Сначала включи ISOLATED.")
         return
 
-    # проверка isolated (особенно для bitget)
-    if d["exchange"] == "bitget":
-        if not is_isolated_mode_on_bitget(ex, sym):
-            await context.bot.send_message(chat_id, "⚠️ Bitget сейчас в CROSS/CRUZADO. Сначала включи ISOLATED.")
-            return
+# 🔹 Проверка минимального объёма для всех бирж (включая MEXC)
+try:
+    market = ex.market(sym)
+    min_amt = market.get("limits", {}).get("amount", {}).get("min", 0)
+    if min_amt and amount < min_amt:
+        log.warning(f"amount {amount:.4f} < min {min_amt:.4f}, adjusted for {sym}")
+        amount = min_amt
+except Exception as e:
+    log.warning(f"min amount check failed for {sym}: {e}")
 
-    set_leverage_isolated(ex, sym, LEVERAGE)
+set_leverage_isolated(ex, sym, LEVERAGE)
 
     if side == "long":
         sl_price = entry * (1 - sl_pct)
