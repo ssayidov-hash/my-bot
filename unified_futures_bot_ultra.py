@@ -25,6 +25,8 @@ trailing-monitor 2.0
 
 улучшенные Telegram-уведомления с режимом маржи и net-профитом
 """
+import nest_asyncio
+nest_asyncio.apply()  # <-- критично для Render + Python 3.13
 
 import os
 import sys
