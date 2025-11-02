@@ -868,7 +868,7 @@ async def auto_scan_loop(app):
                         for i, d in enumerate(top5, 1):
                             line = (
                                 f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} "
-                                f"{signal_strength_tag(d['prob'])]} "
+                                f"{signal_strength_tag(d['prob'])} "
                             )
                             # поправим скобку
                             line = (
