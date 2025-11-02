@@ -389,14 +389,16 @@ async def scan_exchange(name: str, debug_chats: Set[int] = None, bot=None):
                 results.append(d)
         except Exception as e:
             log.warning(f"{name} {s}: {e}")
-        # отправим прогресс, если кто-то в дебаге
-        if debug_chats and bot:
-            txt = f"🔎 {name.upper()}: {idx}/{total}… сигналы={len(results)}"
-            for cid in debug_chats:
-                await bot.send_message(cid, txt)
+       # отправим прогресс, если кто-то в дебаге
+    if debug_chats and bot:
+        txt = f"🔎 {name.upper()}: {idx}/{total}… сигналы={len(results)}"
+        for cid in list(debug_chats):  # ← копия множества
+            await bot.send_message(cid, txt)
         await asyncio.sleep(0.35)
+
     results.sort(key=lambda x: (x["prob"], x["volr"]), reverse=True)
     return results
+
 
 async def scan_all(debug_chats: Set[int] = None, bot=None):
     # запускаем обе биржи параллельно
@@ -405,11 +407,14 @@ async def scan_all(debug_chats: Set[int] = None, bot=None):
     mexc_res = await mexc_task
     bitget_res = await bitget_task
     all_res = mexc_res + bitget_res
+
     if debug_chats and bot:
-        txt = f"✅ Скан завершён. Найдено {len(all_res)} сигналов."
-        for cid in debug_chats:
-            await bot.send_message(cid, txt)
+        summary = f"✅ Скан завершён. Найдено {len(all_res)} сигналов."
+        for cid in list(debug_chats):  # ← тоже копия
+            await bot.send_message(cid, summary)
+
     return all_res
+
 
 # =====================================================
 # TELEGRAM UI
