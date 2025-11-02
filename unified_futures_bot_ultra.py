@@ -433,25 +433,40 @@ def build_signal_keyboard(index: int) -> InlineKeyboardMarkup:
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "*🤖 UNIFIED FUTURES BOT v2.5.4 SAFE*\n\n"
-        "⚙️ Параметры:\n"
-        f"• TF: {TIMEFRAME}\n"
-        f"• Автоскан: {SCAN_INTERVAL//60} мин\n"
-        f"• Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f}M USDT\n"
-        f"• SL (min): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
-        f"• Плечо: x{LEVERAGE}\n"
-        f"• Trailing: с +{TRAILING_ACTIVATION_PCT*100:.1f}%, шаг {TRAILING_DISTANCE_PCT*100:.1f}%\n\n"
-        "📋 Команды:\n"
-        "/scan — найти сигналы\n"
-        "/top — топ-3 сильных\n"
-        "/trade <№> <сумма> — войти по сигналу\n"
-        "/report — активные сделки\n"
-        "/history — файл сделок\n"
-        "/stop — выключить авто\n"
-        "💡 Кнопки BUY/EST есть и в авто-сигналах."
+    await update.message.reply_text(
+        "🤖 Бот запущен и готов к работе!\n"
+        "Используй команду /info, чтобы увидеть параметры, советы и список всех функций."
     )
-    await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "*UNIFIED FUTURES BOT v2.5.5 AUTO BUTTONS*\n\n"
+        "⚙️ **Параметры:**\n"
+        f"• Таймфрейм: {TIMEFRAME}\n"
+        f"• Автоскан: каждые {SCAN_INTERVAL//60} мин\n"
+        f"• Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f}M USDT\n"
+        f"• RSI: OB {RSI_OVERBOUGHT} / OS {RSI_OVERSOLD}\n"
+        f"• EMA: {EMA_SHORT}/{EMA_LONG}\n"
+        f"• SL (base): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
+        f"• Плечо: x{LEVERAGE}\n"
+        f"• Trailing: активируется с +{TRAILING_ACTIVATION_PCT*100:.1f}%, дистанция {TRAILING_DISTANCE_PCT*100:.1f}%\n\n"
+        "📋 **Команды:**\n"
+        "/scan — ручной поиск сигналов\n"
+        "/top — топ-3 сильных\n"
+        "/trade <№> <сумма> — вход по сигналу\n"
+        "/report — активные сделки\n"
+        "/history — журнал сделок (.csv)\n"
+        "/stop — выключить авто-скан\n\n"
+        "💡 **Советы:**\n"
+        "• Лучше торговать по сильным (🔥) сигналам.\n"
+        "• Избегай слабых (⚠️/❄️) при низком объёме.\n"
+        "• Оптимальное ожидание сделки — 20–30 мин.\n"
+        "• TP/SL и трейлинг фиксируются через бота.\n"
+        "• Можно торговать прямо из кнопок BUY / EST.\n\n"
+        "📈 Бот 24/7 сканирует MEXC + Bitget и шлёт сигналы с кнопками."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1080,6 +1095,7 @@ async def main():
     print("✅ Application initialized", flush=True)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", info))  # 👈 вот это новое
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("trade", trade_cmd))
