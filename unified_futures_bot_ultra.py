@@ -1,41 +1,23 @@
+import nest_asyncio
+nest_asyncio.apply()  # критично для Render / py 3.13 / telegram async
+
 # -*- coding: utf-8 -*-
 """
-unified_futures_bot_ultra2.5.1.py
+unified_futures_bot_ultra_v2.5.4_SAFE.py
 MEXC + Bitget | 24/7 | x5 | сигналы по тренду | /scan | /top | /trade <№> <сумма>
-с кнопками: EST 10/20/50/100 и BUY 10/20/50/100
-логирование сделок в ./data/trades_history.csv
-
-улучшения внутри:
-
-фикс пути DATA_DIR → os.path.join(os.getcwd(), "data")
-
-trailing-monitor 2.0
-
-изоляция проверки маржи (ISOLATED only)
-
-автоматическая фиксация TP/SL ботом, если биржа не поддерживает
-
-расширенный CSV-лог с ROI, Win/Loss, профитом
-
-понятные сообщения Bitget/MEXC вместо JSON
-
-автообновление активных позиций (fetch_positions)
-
-анти-дубль проверки при старте
-
-улучшенные Telegram-уведомления с режимом маржи и net-профитом
++ кнопки BUY/EST и в авто-скане
++ активный мониторинг SL/TP/trailing
++ попытка выставить TP/SL на Bitget
 """
-import nest_asyncio
-nest_asyncio.apply()  # <-- критично для Render + Python 3.13
 
 import os
 import sys
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import datetime as dt
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 
 import requests
 import ccxt
@@ -44,17 +26,19 @@ import numpy as np
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    CallbackQueryHandler,
 )
 
-# ================== ENV ==================
+# =====================================================
+# ENV + анти-дубль
+# =====================================================
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
@@ -63,50 +47,24 @@ BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 
 if not TG_BOT_TOKEN:
-    raise SystemExit("❌ TG_BOT_TOKEN обязателен")
+    raise SystemExit("❗ Нужно задать TG_BOT_TOKEN в переменных окружения")
 
-# ================== АНТИ-ДУБЛЬ ==================
 def ensure_single_instance(token: str):
-    if not token:
-        return
+    """если вебхук у бота включён — значит уже есть живой инстанс, выходим"""
     try:
         resp = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=8)
         data = resp.json()
-        # если у бота уже что-то висит — выходим
         if data.get("ok") and data.get("result", {}).get("url"):
-            print("⚠️ Другой инстанс бота уже активен (webhook). Завершение.")
+            print("⚠️ Duplicate instance detected — shutting down.", flush=True)
             sys.exit(0)
     except Exception as e:
-        # если запрос не удался — просто продолжаем
-        print(f"[anti-dup] не удалось проверить webhook: {e}", flush=True)
+        print(f"Webhook check failed: {e}", flush=True)
 
 ensure_single_instance(TG_BOT_TOKEN)
 
-# ================== ПУТИ И ЛОГИ ==================
-BASE_DIR = os.getcwd()
-DATA_DIR = os.path.join(BASE_DIR, "data")
-LOG_DIR = os.path.join(DATA_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
-
-LOG_FILENAME = os.path.join(
-    LOG_DIR,
-    f"{datetime.now(timezone.utc).date().isoformat()}_v2.5.1.log"
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("UFuturesBot2.5.1")
-
-TRADES_CSV = os.path.join(DATA_DIR, "trades_history.csv")
-
-# ================== ПАРАМЕТРЫ ==================
+# =====================================================
+# ПАРАМЕТРЫ
+# =====================================================
 TIMEFRAME = "15m"
 LIMIT = 300
 
@@ -120,34 +78,62 @@ VOL_SMA = 20
 ATR_PERIOD = 14
 
 LEVERAGE = 5
-BASE_STOP_LOSS_PCT = 0.05          # 5% — с запасом
-MIN_QUOTE_VOLUME = 5_000_000       # 5M USDT — отсекаем тухлые
 
-SCAN_INTERVAL = 300                # 5 мин
-AUTO_MONITOR_INTERVAL = 15         # было 60, сделали 15 сек для Bitget
+# было 5%, ты попросил 3.5%
+BASE_STOP_LOSS_PCT = 0.035          # 3.5% — безопаснее, чем 5 при частом входе
+MIN_QUOTE_VOLUME = 5_000_000        # 5M USDT
+SCAN_INTERVAL = 300                 # авто-скан раз в 5 мин
+TRAILING_ACTIVATION_PCT = 0.03      # включаем трейлинг при +3%
+TRAILING_DISTANCE_PCT = 0.015       # расстояние 1.5%
 NO_SIGNAL_NOTIFY_INTERVAL = 3600
 
 PARTIAL_TP_RATIO = 0.5
 TP1_MULTIPLIER_TREND = 2.0
 TP2_MULTIPLIER_TREND = 4.0
 
-# ТРЕЙЛИНГ — ты попросил 3% и дистанцию 1.5%
-TRAILING_ACTIVATION_PCT = 0.03     # при прибыли 3% активируем
-TRAILING_DISTANCE_PCT = 0.015      # держим стоп на 1.5% позади цены
-
 # комиссии
-TAKER_FEE = 0.0006   # 0.06%
-MAKER_FEE = 0.0002   # 0.02%
+TAKER_FEE = 0.0006
+MAKER_FEE = 0.0002
 
-# ================== ГЛОБАЛЫ ==================
-LAST_SCAN: Dict[int, List[Dict[str, Any]]] = {}   # chat_id -> список сигналов в словарях
+# папки
+BASE_DIR = os.getcwd()
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+LOG_FILENAME = os.path.join(
+    LOG_DIR,
+    f"{datetime.now(dt.timezone.utc).date().isoformat()}_v2.5.4_SAFE.log"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("UFutures2.5.4")
+
+# =====================================================
+# ГЛОБАЛЫ
+# =====================================================
+LAST_SCAN: Dict[int, List[Tuple]] = {}      # chat_id -> list(signals)
 ACTIVE_TRADES: Dict[int, List[Dict[str, Any]]] = {}
 AUTO_ENABLED = True
 H1_TRENDS_CACHE: Dict[str, Tuple[str, float]] = {}
 H4_TRENDS_CACHE: Dict[str, Tuple[str, float]] = {}
 LAST_NO_SIGNAL_TIME = 0
+LAST_AUTO_SENT: Dict[int, str] = {}         # чат -> текст последнего авто сообщения
+TRADES_CSV = os.path.join(DATA_DIR, "trades_history.csv")
 
-# ========= ВСПОМОГАТЕЛЬНЫЕ =========
+APP = None  # сюда сохраним app из main, чтобы trailing_monitor мог слать сообщения
+
+# =====================================================
+# ВСПОМОГАТЕЛЬНЫЕ
+# =====================================================
 def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False).mean()
 
@@ -190,42 +176,6 @@ def detect_sr_levels(df, tol_factor=1.0, min_touch=3, left=2):
     nearS = abs(close - sup) / sup < tol if sup else False
     return res, nearR, sup, nearS
 
-def estimate_time_to_tp(entry: float, tp_price: float, atr_val: float, tf_minutes: int = 15) -> int:
-    dist = abs(tp_price - entry)
-    if atr_val <= 0:
-        return tf_minutes
-    candles = max(1, dist / atr_val)
-    return int(candles * tf_minutes)
-
-def estimate_net_profit_pct(tp_pct: float) -> float:
-    total_fee = TAKER_FEE + MAKER_FEE
-    return tp_pct - total_fee
-
-def signal_strength_tag(prob: int) -> str:
-    if prob >= 85:
-        return "🔥 Сильный"
-    elif prob >= 70:
-        return "⚡ Хороший"
-    elif prob >= 55:
-        return "⚠️ Средний"
-    else:
-        return "❄️ Слабый"
-
-def normalize_amount_for_exchange(ex: ccxt.Exchange, symbol: str, amount: float) -> float:
-    try:
-        market = ex.market(symbol)
-        lot = market.get("limits", {}).get("amount", {}).get("min") or market.get("precision", {}).get("amount")
-        if lot:
-            amt = float(ex.amount_to_precision(symbol, amount))
-            if amt < float(lot):
-                # если меньше минимума — возвращаем 0, пусть бот скажет
-                return 0.0
-            return amt
-    except Exception:
-        pass
-    return amount
-
-# ================== EXCHANGES ==================
 def make_exchange(exchange_name: str):
     if exchange_name == "mexc":
         return ccxt.mexc({
@@ -262,6 +212,80 @@ async def fetch_trend(ex: ccxt.Exchange, symbol: str, tf: str, cache: Dict[str, 
     except Exception:
         return "flat"
 
+def estimate_time_to_tp(entry: float, tp_price: float, atr_val: float, tf_minutes: int = 15) -> int:
+    dist = abs(tp_price - entry)
+    if atr_val <= 0:
+        return tf_minutes
+    candles = max(1, dist / atr_val)
+    return int(candles * tf_minutes)
+
+def estimate_net_profit_pct(tp_pct: float) -> float:
+    total_fee = TAKER_FEE + MAKER_FEE
+    return tp_pct - total_fee
+
+def calc_position_amount(balance_usdt: float, entry_price: float, stake_usdt: float, leverage: int) -> float:
+    stake_usdt = min(stake_usdt, balance_usdt)
+    return (stake_usdt * leverage) / entry_price
+
+def signal_strength_tag(prob: int) -> str:
+    if prob >= 85:
+        return "🔥 Сильный"
+    elif prob >= 70:
+        return "⚡ Хороший"
+    elif prob >= 55:
+        return "⚠️ Средний"
+    else:
+        return "❄️ Слабый"
+
+def normalize_amount_for_exchange(ex: ccxt.Exchange, symbol: str, amount: float) -> float:
+    try:
+        return float(ex.amount_to_precision(symbol, amount))
+    except Exception:
+        return amount
+
+def is_isolated_mode_on_bitget(ex: ccxt.Exchange, symbol: str) -> bool:
+    try:
+        pos = ex.fetch_positions([symbol])
+        for p in pos:
+            mm = p.get("info", {}).get("marginMode") or p.get("marginMode")
+            if mm and mm.lower() == "isolated":
+                return True
+        return False
+    except Exception:
+        return True  # не блокируем если не смогли прочитать
+
+def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int, side: str = "long"):
+    try:
+        if ex.id == "mexc":
+            ex.set_leverage(
+                lev, symbol,
+                params={
+                    "openType": 1,  # isolated
+                    "positionType": 1 if side == "long" else 2,
+                }
+            )
+        else:
+            ex.set_leverage(
+                lev, symbol,
+                params={
+                    "marginMode": "isolated",
+                    "posMode": "one_way",
+                }
+            )
+    except Exception as e:
+        log.warning(f"set_leverage {symbol}: {e}")
+
+def append_trade_row(row: Dict[str, Any]):
+    file_exists = os.path.exists(TRADES_CSV)
+    df_row = pd.DataFrame([row])
+    if file_exists:
+        df_row.to_csv(TRADES_CSV, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(TRADES_CSV, mode="w", header=True, index=False)
+
+# =====================================================
+# АНАЛИТИКА
+# =====================================================
 def load_top_usdt_swaps(ex: ccxt.Exchange, top_n=60):
     ex.load_markets()
     tickers = ex.fetch_tickers()
@@ -277,7 +301,6 @@ def load_top_usdt_swaps(ex: ccxt.Exchange, top_n=60):
     rows.sort(key=lambda x: x[1], reverse=True)
     return [s for s,_ in rows[:top_n]]
 
-# ================== АНАЛИЗ СИМВОЛА ==================
 async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
     ohlcv = await asyncio.to_thread(ex.fetch_ohlcv, symbol, TIMEFRAME, None, LIMIT)
     if len(ohlcv) < LIMIT // 2:
@@ -368,7 +391,6 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
         "net_tp1_pct": net_tp1_pct,
     }
 
-# ================== СКАН ==================
 async def scan_exchange(name: str):
     ex = make_exchange(name)
     syms = await asyncio.to_thread(load_top_usdt_swaps, ex, 60)
@@ -391,167 +413,43 @@ async def scan_all():
     bitget_res = await bitget_task
     return mexc_res + bitget_res
 
-# ================== ЛОГИ СДЕЛОК ==================
-CSV_HEADERS = [
-    "ts_open", "ts_close", "exchange", "symbol", "side",
-    "entry_price", "exit_price", "result", "profit_usdt",
-    "profit_pct", "stake_usdt", "leverage",
-    "sl_price", "tp1_price", "tp2_price", "note"
-]
-
-def init_trades_csv():
-    if not os.path.exists(TRADES_CSV):
-        df = pd.DataFrame(columns=CSV_HEADERS)
-        df.to_csv(TRADES_CSV, index=False, encoding="utf-8")
-
-def append_trade_row(row: dict):
-    try:
-        df = pd.DataFrame([row])
-        df.to_csv(TRADES_CSV, mode="a", header=not os.path.exists(TRADES_CSV), index=False, encoding="utf-8")
-    except Exception as e:
-        log.error(f"append_trade_row error: {e}")
-
-init_trades_csv()
-
-# ================== ТРЕЙДЫ ==================
-def set_leverage_isolated(ex: ccxt.Exchange, symbol: str, lev: int, side: str = "long"):
-    try:
-        if ex.id == "mexc":
-            ex.set_leverage(
-                lev, symbol,
-                params={
-                    "openType": 1,  # 1 = isolated, 2 = cross
-                    "positionType": 1 if side == "long" else 2,  # 1 long / 2 short
-                }
-            )
-        else:
-            ex.set_leverage(
-                lev, symbol,
-                params={
-                    "marginMode": "isolated",
-                    "posMode": "one_way",
-                }
-            )
-    except Exception as e:
-        log.warning(f"set_leverage {symbol}: {e}")
-
-
-def is_isolated_mode_on_bitget(ex: ccxt.Exchange, symbol: str) -> bool:
-    try:
-        poss = ex.fetch_positions()
-        for p in poss:
-            if p.get("symbol") == symbol or p.get("info", {}).get("symbol") == symbol:
-                mm = p.get("marginMode") or p.get("info", {}).get("marginMode")
-                if mm and str(mm).lower().startswith("isol"):
-                    return True
-        # если позиции нет — попробуем создать isolated на будущее
-        return True  # не мешаем входу если нет поз
-    except Exception as e:
-        log.warning(f"is_isolated_mode_on_bitget error: {e}")
-        return True
-
-def calc_position_amount(balance_usdt: float, entry_price: float, stake_usdt: float, leverage: int) -> float:
-    stake_usdt = min(stake_usdt, balance_usdt)
-    if entry_price <= 0:
-        return 0.0
-    return (stake_usdt * leverage) / entry_price
-
-def humanize_ccxt_error(e: Exception) -> str:
-    msg = str(e)
-    if "400172" in msg:
-        return "биржа отклонила тип ордера (order type illegal) — надо market / reduceOnly"
-    if "40762" in msg or "insufficient" in msg.lower():
-        return "недостаточно баланса или слишком маленькая / большая сумма"
-    return msg
-
-def place_orders_mexc(ex: ccxt.Exchange, trade: Dict[str, Any]):
-    sym = trade["symbol"]
-    side = trade["side"]
-    entry = trade["entry"]
-    amount = trade["amount"]
-    sl_price = trade["sl_price"]
-    tp1_price = trade["tp1_price"]
-    tp2_price = trade["tp2_price"]
-
-    # вход
-    ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
-    amount1 = amount * PARTIAL_TP_RATIO
-    amount2 = amount - amount1
-    # tp1
-    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount1, tp1_price, params={"reduceOnly": True})
-    # tp2
-    ex.create_order(sym, "limit", "sell" if side == "long" else "buy", amount2, tp2_price, params={"reduceOnly": True})
-    # sl
-    ex.create_order(sym, "stop_market", "sell" if side == "long" else "buy", amount, params={"reduceOnly": True, "triggerPrice": sl_price})
-
-def place_orders_bitget(ex: ccxt.Exchange, trade: Dict[str, Any]):
-    # Bitget не даёт сразу все ордера, поэтому только вход
-    sym = trade["symbol"]
-    side = trade["side"]
-    amount = trade["amount"]
-    ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
-    # дальше мониторинг закроет
-
-async def close_position_market(ex: ccxt.Exchange, trade: Dict[str, Any]):
-    sym = trade["symbol"]
-    side = trade["side"]
-    amount = trade["amount"]
-    try:
-        # reduceOnly если поддерживает
-        ex.create_market_order(sym, "sell" if side == "long" else "buy", amount, params={"reduceOnly": True})
-    except Exception:
-        # fallback
-        ex.create_market_order(sym, "sell" if side == "long" else "buy", amount)
-
-# ================== TELEGRAM ==================
-def build_signal_keyboard(idx: int) -> InlineKeyboardMarkup:
-    # idx — номер сигнала в списке
+# =====================================================
+# TELEGRAM UI
+# =====================================================
+def build_signal_keyboard(index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("EST 10", callback_data=f"est:{idx}:10"),
-            InlineKeyboardButton("EST 20", callback_data=f"est:{idx}:20"),
-            InlineKeyboardButton("EST 50", callback_data=f"est:{idx}:50"),
-            InlineKeyboardButton("EST 100", callback_data=f"est:{idx}:100"),
+            InlineKeyboardButton(f"BUY 10", callback_data=f"BUY|{index}|10"),
+            InlineKeyboardButton(f"BUY 20", callback_data=f"BUY|{index}|20"),
+            InlineKeyboardButton(f"BUY 50", callback_data=f"BUY|{index}|50"),
+            InlineKeyboardButton(f"BUY 100", callback_data=f"BUY|{index}|100"),
         ],
         [
-            InlineKeyboardButton("BUY 10", callback_data=f"buy:{idx}:10"),
-            InlineKeyboardButton("BUY 20", callback_data=f"buy:{idx}:20"),
-            InlineKeyboardButton("BUY 50", callback_data=f"buy:{idx}:50"),
-            InlineKeyboardButton("BUY 100", callback_data=f"buy:{idx}:100"),
-        ],
+            InlineKeyboardButton(f"EST 10", callback_data=f"EST|{index}|10"),
+            InlineKeyboardButton(f"EST 20", callback_data=f"EST|{index}|20"),
+            InlineKeyboardButton(f"EST 50", callback_data=f"EST|{index}|50"),
+            InlineKeyboardButton(f"EST 100", callback_data=f"EST|{index}|100"),
+        ]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "*🤖 UNIFIED FUTURES BOT v2.5.1 PRO*\n\n"
-        "⚙️ *Параметры стратегии:*\n"
-        f"• Таймфрейм: {TIMEFRAME}\n"
-        f"• Автоскан: каждые {SCAN_INTERVAL//60} мин\n"
+        "*🤖 UNIFIED FUTURES BOT v2.5.4 SAFE*\n\n"
+        "⚙️ Параметры:\n"
+        f"• TF: {TIMEFRAME}\n"
+        f"• Автоскан: {SCAN_INTERVAL//60} мин\n"
         f"• Мин. объём: {MIN_QUOTE_VOLUME/1_000_000:.1f}M USDT\n"
-        f"• RSI OB/OS: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
-        f"• EMA: {EMA_SHORT}/{EMA_LONG}\n"
-        f"• SL (базовый): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
+        f"• SL (min): {BASE_STOP_LOSS_PCT*100:.1f}%\n"
         f"• Плечо: x{LEVERAGE}\n"
-        f"• Trailing: активируется с +{TRAILING_ACTIVATION_PCT*100:.1f}%, дистанция {TRAILING_DISTANCE_PCT*100:.1f}%\n"
-        f"• Комиссия (вход+выход): {(TAKER_FEE+MAKER_FEE)*100:.2f}%\n"
-        f"• TP1/TP2 множители ATR: {TP1_MULTIPLIER_TREND}/{TP2_MULTIPLIER_TREND}\n"
-        f"• Min ETA: 15m candle-based estimation\n\n"
-
-        "📋 *Команды:*\n"
+        f"• Trailing: с +{TRAILING_ACTIVATION_PCT*100:.1f}%, шаг {TRAILING_DISTANCE_PCT*100:.1f}%\n\n"
+        "📋 Команды:\n"
         "/scan — найти сигналы\n"
         "/top — топ-3 сильных\n"
         "/trade <№> <сумма> — войти по сигналу\n"
         "/report — активные сделки\n"
-        "/history — файл всех сделок (лог)\n"
-        "/stop — выключить автоскан\n\n"
-
-        "💡 *Советы:*\n"
-        "• Используй 🔥 сигналы с prob ≥ 80%\n"
-        "• Лучше входить в сторону тренда (H1/H4 совпадают)\n"
-        "• Перед реальной торговлей протестируй EST-кнопки\n"
-        "• Трейлинг фиксирует прибыль при развороте цены\n\n"
-
-        "🚀 Бот готов к работе! Используй /scan чтобы начать поиск сигналов."
+        "/history — файл сделок\n"
+        "/stop — выключить авто\n"
+        "💡 Кнопки BUY/EST есть и в авто-сигналах."
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
@@ -564,20 +462,24 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LAST_SCAN[chat_id] = []
         return
 
-    LAST_SCAN[chat_id] = entries
-    # показываем только первые 10 с кнопками
-    for i, d in enumerate(entries[:10], 1):
+    LAST_SCAN[chat_id] = []
+    for i, d in enumerate(entries[:15], 1):
         tag = signal_strength_tag(d["prob"])
-        msg = (
+        text = (
             f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {tag} ({d['prob']}%)\n"
             f"RSI={d['rsi']:.1f} | vol×={d['volr']:.2f} | H1={d['h1']} H4={d['h4']}\n"
-            f"Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин\n"
-            f"Net≈+{d['net_tp1_pct']*100:.2f}%"
+            f"Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин"
         )
         await update.effective_message.reply_text(
-            msg,
-            reply_markup=build_signal_keyboard(i-1)
+            text,
+            reply_markup=build_signal_keyboard(i),
+            parse_mode=None,
         )
+        LAST_SCAN[chat_id].append((
+            d["symbol"], d["side"], d["exchange"],
+            d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
+            d["tp1_price"], d["tp2_price"], d["eta_min"], d["prob"], d["volr"], d["rsi"]
+        ))
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -588,23 +490,27 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     strong = [d for d in entries if d["prob"] >= 80]
     if not strong:
         strong = entries[:3]
-    LAST_SCAN[chat_id] = strong
+    LAST_SCAN[chat_id] = []
     for i, d in enumerate(strong[:3], 1):
-        tag = signal_strength_tag(d["prob"])
-        msg = (
-            f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {tag} ({d['prob']}%)\n"
+        text = (
+            f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} — {signal_strength_tag(d['prob'])} ({d['prob']}%)\n"
             f"Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин"
         )
         await update.effective_message.reply_text(
-            msg,
-            reply_markup=build_signal_keyboard(i-1)
+            text,
+            reply_markup=build_signal_keyboard(i),
         )
+        LAST_SCAN[chat_id].append((
+            d["symbol"], d["side"], d["exchange"],
+            d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
+            d["tp1_price"], d["tp2_price"], d["eta_min"], d["prob"], d["volr"], d["rsi"]
+        ))
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(TRADES_CSV):
         await update.effective_message.reply_document(open(TRADES_CSV, "rb"))
     else:
-        await update.effective_message.reply_text("История пока пуста.")
+        await update.effective_message.reply_text("История пока пустая.")
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -624,6 +530,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AUTO_ENABLED = False
     await update.effective_message.reply_text("Автоскан отключён.")
 
+# =====================================================
+# ТОРГОВЛЯ (команда)
+# =====================================================
 async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     m = update.effective_message
@@ -640,383 +549,534 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("Номер и сумма должны быть числами.")
         return
 
-    entries = LAST_SCAN[chat_id]
-    if idx < 0 or idx >= len(entries):
+    rows = LAST_SCAN[chat_id]
+    if idx < 0 or idx >= len(rows):
         await m.reply_text("Нет такого номера сигнала.")
         return
 
-    d = entries[idx]
-    await execute_trade_from_signal(update, context, chat_id, d, stake)
+    sym, side, exchange, entry, sl_pct, tp1_pct, tp2_pct, tp1_price, tp2_price, eta_min, prob, volr, rsi_val = rows[idx]
+    ex = make_exchange(exchange)
 
-# ================== INLINE CALLBACK ==================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    await query.answer()
-    data = query.data  # формат: est:<idx>:<usdt> или buy:<idx>:<usdt>
-    try:
-        action, idx, usdt = data.split(":")
-        idx = int(idx)
-        usdt = float(usdt)
-    except Exception:
+    # MEXC — сигналы только руками
+    if exchange == "mexc":
+        await m.reply_text("⚠️ MEXC фьючерсы сейчас не даём через API. Сигнал есть — выставь руками.")
         return
-    if chat_id not in LAST_SCAN or idx >= len(LAST_SCAN[chat_id]):
-        await query.edit_message_text("Сигнал устарел, сделай /scan")
-        return
-    signal = LAST_SCAN[chat_id][idx]
 
-    if action == "est":
-        # просто расчёт
-        tp1_pct = signal["tp1_pct"]
-        net = estimate_net_profit_pct(tp1_pct)
-        profit = usdt * net
-        await query.message.reply_text(
-            f"📈 Оценка {signal['symbol']} {signal['side'].upper()} на {usdt:.1f} USDT:\n"
-            f"TP1: +{tp1_pct*100:.2f}% → ≈ +{profit:.2f} USDT (с комиссией)\n"
-            f"ETA: {signal['eta_min']} мин"
-        )
-    elif action == "buy":
-        # сразу покупаем
-        fake_update = Update(update.update_id, message=query.message)
-        await execute_trade_from_signal(fake_update, context, chat_id, signal, usdt)
-
-# ================== ВСПОМОГ ФОРМА СДЕЛКИ ==================
-async def execute_trade_from_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, d: Dict[str, Any], stake: float):
-    ex = make_exchange(d["exchange"])
-    sym = d["symbol"]
-    side = d["side"]
-    entry = d["entry"]
-    sl_pct = d["sl_pct"]
-    tp1_price = d["tp1_price"]
-    tp2_price = d["tp2_price"]
-
-    # баланс
     try:
         bal = ex.fetch_balance(params={"type": "swap"})["USDT"]["free"]
     except Exception as e:
-        await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Не смог получить баланс: {e}")
-        return
-amount = calc_position_amount(bal, entry, stake, LEVERAGE)
-amount = normalize_amount_for_exchange(ex, sym, amount)
-if amount <= 0:
-    await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Слишком маленькая сумма для {sym}")
-    return
-
-# проверка isolated (особенно для bitget)
-if d["exchange"] == "bitget":
-    if not is_isolated_mode_on_bitget(ex, sym):
-        await context.bot.send_message(chat_id, "⚠️ Bitget сейчас в CROSS/CRUZADO. Сначала включи ISOLATED.")
+        await m.reply_text(f"[{exchange.upper()}] Не смог получить баланс: {e}")
         return
 
-# 🔹 Проверка минимального объёма для всех бирж (включая MEXC)
-try:
-    market = ex.market(sym)
-    min_amt = market.get("limits", {}).get("amount", {}).get("min", 0)
-    if min_amt and amount < min_amt:
-        log.warning(f"amount {amount:.4f} < min {min_amt:.4f}, adjusted for {sym}")
-        amount = min_amt
-except Exception as e:
-    log.warning(f"min amount check failed for {sym}: {e}")
+    amount = calc_position_amount(bal, entry, stake, LEVERAGE)
+    amount = normalize_amount_for_exchange(ex, sym, amount)
+    if amount <= 0:
+        await m.reply_text(f"[{exchange.upper()}] Слишком маленькая сумма для {sym}")
+        return
 
-set_leverage_isolated(ex, sym, LEVERAGE)
+    # bitget: проверяем isolated
+    if exchange == "bitget":
+        if not is_isolated_mode_on_bitget(ex, sym):
+            await m.reply_text("⚠️ Bitget сейчас в CROSS/CRUZADO. Сначала включи ISOLATED.")
+            return
+
+    # проверка минимального объёма
+    try:
+        market = ex.market(sym)
+        min_amt = market.get("limits", {}).get("amount", {}).get("min", 0)
+        if min_amt and amount < min_amt:
+            log.warning(f"amount {amount:.4f} < min {min_amt:.4f}, adjusted for {sym}")
+            amount = min_amt
+    except Exception as e:
+        log.warning(f"min amount check failed for {sym}: {e}")
+
+    set_leverage_isolated(ex, sym, LEVERAGE, side=side)
+
+    # SL/TP уровни
+    if side == "long":
+        sl_price = entry * (1 - sl_pct)
+    else:
+        sl_price = entry * (1 + sl_pct)
+
+    # 1) открываем позицию
+    try:
+        ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
+    except Exception as e:
+        await m.reply_text(f"[{exchange.upper()}] Ошибка ордеров: {e}")
+        log.error(f"order error: {e}")
+        return
+
+    # 2) пытаемся сразу поставить TP и SL на бирже (bitget)
+    placed_on_exchange = False
+    if exchange == "bitget":
+        try:
+            # TP1
+            ex.create_order(
+                sym,
+                type="limit",
+                side="sell" if side == "long" else "buy",
+                amount=amount * PARTIAL_TP_RATIO,
+                price=tp1_price,
+                params={
+                    "reduceOnly": True,
+                    "marginMode": "isolated",
+                }
+            )
+            # SL
+            ex.create_order(
+                sym,
+                type="stop_market",
+                side="sell" if side == "long" else "buy",
+                amount=amount,
+                params={
+                    "reduceOnly": True,
+                    "triggerPrice": sl_price,
+                    "marginMode": "isolated",
+                }
+            )
+            placed_on_exchange = True
+        except Exception as e:
+            log.warning(f"Bitget TP/SL on-exchange skipped: {e}")
+            placed_on_exchange = False
+
+    # 3) сохраняем сделку для мониторинга
+    ACTIVE_TRADES.setdefault(chat_id, []).append({
+        "symbol": sym,
+        "side": side,
+        "entry": entry,
+        "amount": amount,
+        "exchange": exchange,
+        "tp1_price": tp1_price,
+        "tp2_price": tp2_price,
+        "sl_price": sl_price,
+        "time": datetime.now(dt.timezone.utc),
+        "stake": stake,
+        "trailing_on": False,
+        "placed_on_exchange": placed_on_exchange,
+    })
+
+    net_pct = estimate_net_profit_pct(tp1_pct)
+    append_trade_row({
+        "ts": datetime.now(dt.timezone.utc).isoformat(),
+        "chat_id": chat_id,
+        "exchange": exchange,
+        "symbol": sym,
+        "side": side,
+        "entry": entry,
+        "amount": amount,
+        "stake": stake,
+        "tp1": tp1_price,
+        "tp2": tp2_price,
+        "sl": sl_price,
+        "prob": prob,
+        "eta_min": eta_min,
+        "reason": "OPEN",
+    })
+
+    await m.reply_text(
+        f"✅ [{exchange.upper()}] Открыт {side.upper()} {sym}\n"
+        f"Сумма: {stake} USDT (x{LEVERAGE}) → объём {amount:.4f}\n"
+        f"Entry: {entry:.6f}\n"
+        f"SL: {sl_price:.6f} (−{sl_pct*100:.1f}%)\n"
+        f"TP1: {tp1_price:.6f} (+{tp1_pct*100:.1f}%)\n"
+        f"TP2: {tp2_price:.6f} (+{tp2_pct*100:.1f}%)\n"
+        f"⏱️ ETA: ~{eta_min} мин\n"
+        f"💰 Net: +{net_pct*100:.2f}%\n"
+        + (
+            "✅ TP/SL выставлены на бирже.\n"
+            if placed_on_exchange else
+            "⚠️ Bitget: TP/SL не поставлены на бирже, фиксация — через бота.\n"
+        )
+    )
+
+# =====================================================
+# CALLBACK (кнопки BUY/EST)
+# =====================================================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # BUY|idx|amount  или EST|idx|amount
+    chat_id = query.message.chat_id
+    if chat_id not in LAST_SCAN or not LAST_SCAN[chat_id]:
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    try:
+        action, idx, amt = data.split("|")
+        idx = int(idx) - 1
+        stake = float(amt)
+    except Exception:
+        return
+
+    rows = LAST_SCAN[chat_id]
+    if idx < 0 or idx >= len(rows):
+        await query.message.reply_text("Сигнал уже устарел, сделай /scan")
+        return
+
+    sym, side, exchange, entry, sl_pct, tp1_pct, tp2_pct, tp1_price, tp2_price, eta_min, prob, volr, rsi_val = rows[idx]
+    ex = make_exchange(exchange)
+
+    # это оценка
+    if action == "EST":
+        net_pct = estimate_net_profit_pct(tp1_pct)
+        profit = stake * net_pct
+        await query.message.reply_text(
+            f"📈 Оценка {sym} {side.upper()} на {stake} USDT:\n"
+            f"TP1: +{tp1_pct*100:.2f}% → ≈ +{profit:.2f} USDT (с комиссией)\n"
+            f"ETA: {eta_min} мин"
+        )
+        log.info(f"[EST] chat={chat_id} {sym} {side} stake={stake}")
+        return
+
+    # это BUY
+    if exchange == "mexc":
+        await query.message.reply_text("⚠️ MEXC фьючерсы по API не ставим. Сигнал смотри и ставь руками.")
+        return
+
+    try:
+        bal = ex.fetch_balance(params={"type": "swap"})["USDT"]["free"]
+    except Exception as e:
+        await query.message.reply_text(f"[{exchange.upper()}] Не смог получить баланс: {e}")
+        return
+
+    amount = calc_position_amount(bal, entry, stake, LEVERAGE)
+    amount = normalize_amount_for_exchange(ex, sym, amount)
+    if amount <= 0:
+        await query.message.reply_text(f"[{exchange.upper()}] Слишком маленькая сумма для {sym}")
+        return
+
+    if exchange == "bitget":
+        if not is_isolated_mode_on_bitget(ex, sym):
+            await query.message.reply_text("⚠️ Bitget сейчас в CROSS/CRUZADO. Сначала включи ISOLATED.")
+            return
+
+    # min amount
+    try:
+        market = ex.market(sym)
+        min_amt = market.get("limits", {}).get("amount", {}).get("min", 0)
+        if min_amt and amount < min_amt:
+            log.warning(f"[BTN] amount {amount:.4f} < min {min_amt:.4f}, adjusted for {sym}")
+            amount = min_amt
+    except Exception as e:
+        log.warning(f"[BTN] min amount check failed for {sym}: {e}")
+
+    set_leverage_isolated(ex, sym, LEVERAGE, side=side)
 
     if side == "long":
         sl_price = entry * (1 - sl_pct)
     else:
         sl_price = entry * (1 + sl_pct)
 
-    trade = {
+    # вход
+    try:
+        ex.create_market_order(sym, "buy" if side == "long" else "sell", amount)
+    except Exception as e:
+        await query.message.reply_text(f"[{exchange.upper()}] Ошибка ордеров: {e}")
+        log.error(f"[BTN] order error: {e}")
+        return
+
+    placed_on_exchange = False
+    if exchange == "bitget":
+        try:
+            # TP
+            ex.create_order(
+                sym,
+                type="limit",
+                side="sell" if side == "long" else "buy",
+                amount=amount * PARTIAL_TP_RATIO,
+                price=tp1_price,
+                params={
+                    "reduceOnly": True,
+                    "marginMode": "isolated",
+                }
+            )
+            # SL
+            ex.create_order(
+                sym,
+                type="stop_market",
+                side="sell" if side == "long" else "buy",
+                amount=amount,
+                params={
+                    "reduceOnly": True,
+                    "triggerPrice": sl_price,
+                    "marginMode": "isolated",
+                }
+            )
+            placed_on_exchange = True
+        except Exception as e:
+            log.warning(f"[BTN] Bitget TP/SL on-exchange skipped: {e}")
+            placed_on_exchange = False
+
+    ACTIVE_TRADES.setdefault(chat_id, []).append({
         "symbol": sym,
         "side": side,
         "entry": entry,
         "amount": amount,
-        "sl_price": sl_price,
+        "exchange": exchange,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,
-        "exchange": d["exchange"],
-        "chat_id": chat_id,
+        "sl_price": sl_price,
+        "time": datetime.now(dt.timezone.utc),
         "stake": stake,
-        "open_time": datetime.now(timezone.utc),
-        "use_trailing": True,
-        "trailing_activation": TRAILING_ACTIVATION_PCT,
-        "trailing_pct": TRAILING_DISTANCE_PCT,
-    }
-
-    try:
-        if d["exchange"] == "mexc":
-            place_orders_mexc(ex, trade)
-            on_exchange_tp_sl = True
-        else:
-            place_orders_bitget(ex, trade)
-            on_exchange_tp_sl = False
-    except Exception as e:
-        h = humanize_ccxt_error(e)
-        await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Ошибка ордеров: {h}")
-        log.error(f"order error: {e}")
-        return
-
-    # сохранить в активные
-    ACTIVE_TRADES.setdefault(chat_id, []).append(trade)
-
-    note_line = ""
-    if d["exchange"] == "bitget":
-        note_line = "⚠️ Bitget: TP/SL не поставлены на бирже, фиксация — через бота."
-
-    net_pct = estimate_net_profit_pct(d["tp1_pct"])
-    await context.bot.send_message(
-        chat_id,
-        f"✅ [{d['exchange'].upper()}] Открыт {side.upper()} {sym}\n"
-        f"Сумма: {stake} USDT (x{LEVERAGE}) → объём {amount:.4f}\n"
-        f"Entry: {entry:.6f}\n"
-        f"SL: {sl_price:.6f} (−{sl_pct*100:.1f}%)\n"
-        f"TP1: {tp1_price:.6f} (+{d['tp1_pct']*100:.1f}%)\n"
-        f"TP2: {tp2_price:.6f} (+{d['tp2_pct']*100:.1f}%)\n"
-        f"⏱️ ETA: ~{d['eta_min']} мин\n"
-        f"💰 Net: +{net_pct*100:.2f}% ≈ +{stake*net_pct:.2f} USDT\n"
-        f"📈 Trailing: {TRAILING_ACTIVATION_PCT*100:.2f}% → стоп {TRAILING_DISTANCE_PCT*100:.2f}%\n"
-        f"{note_line}"
-    )
-
-    # пишем в CSV открытие
-    append_trade_row({
-        "ts_open": trade["open_time"].isoformat(),
-        "ts_close": "",
-        "exchange": d["exchange"],
-        "symbol": sym,
-        "side": side,
-        "entry_price": entry,
-        "exit_price": "",
-        "result": "OPEN",
-        "profit_usdt": "",
-        "profit_pct": "",
-        "stake_usdt": stake,
-        "leverage": LEVERAGE,
-        "sl_price": sl_price,
-        "tp1_price": tp1_price,
-        "tp2_price": tp2_price,
-        "note": note_line,
+        "trailing_on": False,
+        "placed_on_exchange": placed_on_exchange,
     })
 
-# ================== ФОН: АВТО-СКАН ==================
-async def auto_scan_loop(app: Application):
-    global LAST_NO_SIGNAL_TIME
+    append_trade_row({
+        "ts": datetime.now(dt.timezone.utc).isoformat(),
+        "chat_id": chat_id,
+        "exchange": exchange,
+        "symbol": sym,
+        "side": side,
+        "entry": entry,
+        "amount": amount,
+        "stake": stake,
+        "tp1": tp1_price,
+        "tp2": tp2_price,
+        "sl": sl_price,
+        "prob": prob,
+        "eta_min": eta_min,
+        "reason": "OPEN_BTN",
+    })
+
+    await query.message.reply_text(
+        f"✅ [{exchange.upper()}] Открыт {side.upper()} {sym} (кнопка BUY {stake} USDT)\n"
+        f"Entry: {entry:.6f} | SL: {sl_price:.6f} | TP1: {tp1_price:.6f}\n"
+        + (
+            "✅ TP/SL выставлены на бирже."
+            if placed_on_exchange else
+            "⚠️ Bitget: TP/SL не поставлены на бирже, фиксация — через бота."
+        )
+    )
+    log.info(f"[BTN BUY] chat={chat_id} {exchange} {sym} {side} stake={stake}")
+
+# =====================================================
+# ФОН: авто-скан
+# =====================================================
+async def auto_scan_loop(app):
+    global LAST_NO_SIGNAL_TIME, LAST_AUTO_SENT
     while True:
         if AUTO_ENABLED:
             try:
                 entries = await scan_all()
                 now = time.time()
                 if entries:
-                    LAST_NO_SIGNAL_TIME = now
-                    # рассылаем тем, кто уже вызывал /scan
                     for chat_id in list(LAST_SCAN.keys()):
-                        text_lines = []
-                        for i, d in enumerate(entries[:5], 1):
-                            tag = signal_strength_tag(d["prob"])
-                            text_lines.append(
-                                f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} {tag} ETA {d['eta_min']}м"
+                        top5 = entries[:5]
+                        text_parts = []
+                        last_sig_cache = []
+                        for i, d in enumerate(top5, 1):
+                            line = (
+                                f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} "
+                                f"{signal_strength_tag(d['prob'])]} "
                             )
-                        await app.bot.send_message(chat_id, "📊 Автосигналы:\n" + "\n".join(text_lines))
+                            # поправим скобку
+                            line = (
+                                f"{i}. [{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} "
+                                f"{signal_strength_tag(d['prob'])} | "
+                                f"Entry {d['entry']:.6f} | SL {d['sl_pct']*100:.1f}% | TP1 {d['tp1_pct']*100:.1f}% | ETA {d['eta_min']}м"
+                            )
+                            text_parts.append(line)
+                            last_sig_cache.append((
+                                d["symbol"], d["side"], d["exchange"],
+                                d["entry"], d["sl_pct"], d["tp1_pct"], d["tp2_pct"],
+                                d["tp1_price"], d["tp2_price"], d["eta_min"], d["prob"], d["volr"], d["rsi"]
+                            ))
+
+                        full_text = "📊 Автосигналы:\n" + "\n".join(text_parts)
+
+                        # анти-дубль
+                        if LAST_AUTO_SENT.get(chat_id) == full_text:
+                            continue
+                        LAST_AUTO_SENT[chat_id] = full_text
+
+                        LAST_SCAN[chat_id] = last_sig_cache
+
+                        kb = build_signal_keyboard(1)
+                        await app.bot.send_message(chat_id, full_text, reply_markup=kb)
+
+                    LAST_NO_SIGNAL_TIME = now
                 else:
                     if now - LAST_NO_SIGNAL_TIME >= NO_SIGNAL_NOTIFY_INTERVAL:
                         for chat_id in list(LAST_SCAN.keys()):
-                            await app.bot.send_message(chat_id, "Сигналов нет.")
+                            await app.bot.send_message(chat_id, "Автоскан: пока сигналов нет.")
                         LAST_NO_SIGNAL_TIME = now
                 log.info("auto_scan tick OK")
             except Exception as e:
                 log.error(f"auto_scan_loop: {e}")
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ================== ФОН: ТРЕЙЛИНГ И SL ==================
-async def trailing_monitor(app: Application):
+# =====================================================
+# ФОН: трейлинг / SL / TP контроль
+# =====================================================
+async def trailing_monitor():
+    global ACTIVE_TRADES, APP
     while True:
-        try:
-            # пробуем подтянуть актуальные позиции с бирж, чтобы понять, что закрыто вручную
-            await sync_manual_closes()
-
-            # проходим по активным
-            for chat_id, trades in list(ACTIVE_TRADES.items()):
-                if not trades:
-                    continue
-                for trade in trades[:]:
-                    ex = make_exchange(trade["exchange"])
-                    sym = trade["symbol"]
-                    side = trade["side"]
-                    amount = trade["amount"]
-                    entry = trade["entry"]
-                    sl_price = trade["sl_price"]
-                    tp1_price = trade["tp1_price"]
-                    tp2_price = trade["tp2_price"]
-
-                    # текущая цена
-                    try:
-                        ticker = ex.fetch_ticker(sym)
-                        current_price = float(ticker["last"])
-                    except Exception as e:
-                        log.warning(f"trailing fetch_ticker {sym}: {e}")
-                        continue
-
-                    # прибыль в %
-                    if side == "long":
-                        profit_pct_live = (current_price - entry) / entry
-                    else:
-                        profit_pct_live = (entry - current_price) / entry
-
-                    # TP2
-                    tp2_hit = (side == "long" and current_price >= tp2_price) or \
-                              (side == "short" and current_price <= tp2_price)
-                    if tp2_hit:
-                        await close_position_market(ex, trade)
-                        ACTIVE_TRADES[chat_id].remove(trade)
-                        append_trade_row({
-                            "ts_open": trade["open_time"].isoformat(),
-                            "ts_close": datetime.now(timezone.utc).isoformat(),
-                            "exchange": trade["exchange"],
-                            "symbol": sym,
-                            "side": side,
-                            "entry_price": entry,
-                            "exit_price": current_price,
-                            "result": "TP2",
-                            "profit_usdt": (trade["stake"] * profit_pct_live),
-                            "profit_pct": profit_pct_live * 100,
-                            "stake_usdt": trade["stake"],
-                            "leverage": LEVERAGE,
-                            "sl_price": sl_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "note": "TP2 via bot" if trade["exchange"] == "bitget" else "",
-                        })
-                        await app.bot.send_message(chat_id, f"✅ TP2 исполнен по {sym} @ {current_price:.6f}")
-                        continue
-
-                    # TP1
-                    tp1_hit = (side == "long" and current_price >= tp1_price) or \
-                              (side == "short" and current_price <= tp1_price)
-                    if tp1_hit:
-                        # закрываем половину
-                        half = amount * PARTIAL_TP_RATIO
-                        try:
-                            ex.create_market_order(sym, "sell" if side == "long" else "buy", half, params={"reduceOnly": True})
-                        except Exception:
-                            ex.create_market_order(sym, "sell" if side == "long" else "buy", half)
-                        trade["amount"] = amount - half
-                        append_trade_row({
-                            "ts_open": trade["open_time"].isoformat(),
-                            "ts_close": datetime.now(timezone.utc).isoformat(),
-                            "exchange": trade["exchange"],
-                            "symbol": sym,
-                            "side": side,
-                            "entry_price": entry,
-                            "exit_price": current_price,
-                            "result": "TP1",
-                            "profit_usdt": (trade["stake"] * profit_pct_live) * PARTIAL_TP_RATIO,
-                            "profit_pct": profit_pct_live * 100,
-                            "stake_usdt": trade["stake"],
-                            "leverage": LEVERAGE,
-                            "sl_price": sl_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "note": "TP1 via bot" if trade["exchange"] == "bitget" else "",
-                        })
-                        await app.bot.send_message(chat_id, f"✅ TP1 исполнен по {sym} @ {current_price:.6f}")
-                        # дальше смотрим trailing/SL уже для остатка
-                        continue
-
-                    # SL
-                    sl_hit = (side == "long" and current_price <= sl_price) or \
-                             (side == "short" and current_price >= sl_price)
-                    if sl_hit:
-                        await close_position_market(ex, trade)
-                        ACTIVE_TRADES[chat_id].remove(trade)
-                        append_trade_row({
-                            "ts_open": trade["open_time"].isoformat(),
-                            "ts_close": datetime.now(timezone.utc).isoformat(),
-                            "exchange": trade["exchange"],
-                            "symbol": sym,
-                            "side": side,
-                            "entry_price": entry,
-                            "exit_price": current_price,
-                            "result": "SL",
-                            "profit_usdt": (trade["stake"] * profit_pct_live),
-                            "profit_pct": profit_pct_live * 100,
-                            "stake_usdt": trade["stake"],
-                            "leverage": LEVERAGE,
-                            "sl_price": sl_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "note": "SL via bot" if trade["exchange"] == "bitget" else "",
-                        })
-                        await app.bot.send_message(chat_id, f"❌ SL по {sym} @ {current_price:.6f}")
-                        continue
-
-                    # TRAILING
-                    if trade.get("use_trailing") and profit_pct_live >= trade["trailing_activation"]:
-                        if side == "long":
-                            new_sl = current_price * (1 - trade["trailing_pct"])
-                            if new_sl > trade["sl_price"]:
-                                trade["sl_price"] = new_sl
-                                await app.bot.send_message(chat_id, f"🔁 Trailing SL обновлён по {sym}: {new_sl:.6f}")
-                        else:
-                            new_sl = current_price * (1 + trade["trailing_pct"])
-                            if new_sl < trade["sl_price"]:
-                                trade["sl_price"] = new_sl
-                                await app.bot.send_message(chat_id, f"🔁 Trailing SL обновлён по {sym}: {new_sl:.6f}")
-
-        except Exception as e:
-            log.error(f"trailing_monitor: {e}")
-
-        await asyncio.sleep(AUTO_MONITOR_INTERVAL)
-
-# ================== ФОН: СИНК РУЧНЫХ ЗАКРЫТИЙ ==================
-async def sync_manual_closes():
-    # проходим по всем чатам и по всем биржам
-    for chat_id, trades in list(ACTIVE_TRADES.items()):
-        if not trades:
+        # если ещё не инициализировали app — ждём
+        if APP is None:
+            await asyncio.sleep(2)
             continue
-        # группируем по биржам
-        by_ex: Dict[str, List[Dict[str, Any]]] = {}
-        for t in trades:
-            by_ex.setdefault(t["exchange"], []).append(t)
-        for ex_id, tlist in by_ex.items():
-            ex = make_exchange(ex_id)
-            try:
-                poss = ex.fetch_positions()
-            except Exception as e:
-                log.warning(f"sync_manual_closes fetch_positions {ex_id}: {e}")
-                continue
-            active_symbols = set()
-            for p in poss:
-                sym = p.get("symbol") or p.get("info", {}).get("symbol")
-                if sym:
-                    active_symbols.add(sym)
-            # все сделки, которых нет в позициях — удалить и записать в CSV как "Closed manual"
-            for t in tlist[:]:
-                if t["symbol"] not in active_symbols:
-                    # значит, закрыли вручную
-                    ACTIVE_TRADES[chat_id].remove(t)
-                    append_trade_row({
-                        "ts_open": t["open_time"].isoformat(),
-                        "ts_close": datetime.now(timezone.utc).isoformat(),
-                        "exchange": t["exchange"],
-                        "symbol": t["symbol"],
-                        "side": t["side"],
-                        "entry_price": t["entry"],
-                        "exit_price": "",
-                        "result": "CLOSED_MANUAL",
-                        "profit_usdt": "",
-                        "profit_pct": "",
-                        "stake_usdt": t["stake"],
-                        "leverage": LEVERAGE,
-                        "sl_price": t["sl_price"],
-                        "tp1_price": t["tp1_price"],
-                        "tp2_price": t["tp2_price"],
-                        "note": "manual close detected",
-                    })
-                    log.info(f"manual close detected for {t['symbol']}")
 
-# ================== MAIN ==================
+        for chat_id, trades in list(ACTIVE_TRADES.items()):
+            new_trades = []
+            for t in trades:
+                ex = make_exchange(t["exchange"])
+                sym = t["symbol"]
+                side = t["side"]
+                entry = t["entry"]
+                sl_price = t["sl_price"]
+                tp1_price = t["tp1_price"]
+                amount = t["amount"]
+
+                # получаем текущую цену
+                try:
+                    ticker = ex.fetch_ticker(sym)
+                    last = float(ticker["last"])
+                except Exception as e:
+                    log.warning(f"trailing_monitor: fetch_ticker fail {sym}: {e}")
+                    new_trades.append(t)
+                    continue
+
+                # текущий PNL в %
+                if side == "long":
+                    pnl_pct = (last - entry) / entry
+                else:
+                    pnl_pct = (entry - last) / entry
+
+                # SL hit?
+                sl_hit = (side == "long" and last <= sl_price) or (side == "short" and last >= sl_price)
+                # TP1 hit?
+                tp1_hit = (side == "long" and last >= tp1_price) or (side == "short" and last <= tp1_price)
+
+                # 1) сработал SL — закрываем всё
+                if sl_hit:
+                    try:
+                        ex.create_market_order(sym, "sell" if side == "long" else "buy", amount)
+                    except Exception as e:
+                        log.error(f"SL close fail {sym}: {e}")
+                    # телега
+                    try:
+                        roi_pct = pnl_pct * 100
+                        await APP.bot.send_message(
+                            chat_id,
+                            f"⚠️ Закрыл {sym} по SL @ {last:.6f} ({roi_pct:.2f}%)"
+                        )
+                    except Exception as e:
+                        log.warning(f"send sl msg fail: {e}")
+                    # лог в CSV
+                    append_trade_row({
+                        "ts": datetime.now(dt.timezone.utc).isoformat(),
+                        "chat_id": chat_id,
+                        "exchange": t["exchange"],
+                        "symbol": sym,
+                        "side": side,
+                        "entry": entry,
+                        "exit": last,
+                        "roi_pct": pnl_pct * 100,
+                        "reason": "SL",
+                    })
+                    continue  # не оставляем в списке
+
+                # 2) сработал TP1 — закрываем половину и включаем трейлинг
+                if tp1_hit:
+                    close_amt = amount * PARTIAL_TP_RATIO
+                    rest_amt = amount - close_amt
+                    try:
+                        ex.create_market_order(sym, "sell" if side == "long" else "buy", close_amt)
+                    except Exception as e:
+                        log.error(f"TP1 close fail {sym}: {e}")
+
+                    try:
+                        await APP.bot.send_message(
+                            chat_id,
+                            f"✅ TP1 по {sym} @ {last:.6f} (+{pnl_pct*100:.2f}%)"
+                        )
+                    except Exception as e:
+                        log.warning(f"send tp1 msg fail: {e}")
+
+                    append_trade_row({
+                        "ts": datetime.now(dt.timezone.utc).isoformat(),
+                        "chat_id": chat_id,
+                        "exchange": t["exchange"],
+                        "symbol": sym,
+                        "side": side,
+                        "entry": entry,
+                        "exit": last,
+                        "roi_pct": pnl_pct * 100,
+                        "reason": "TP1",
+                    })
+
+                    # остаток — под трейлинг
+                    if rest_amt > 0:
+                        t["amount"] = rest_amt
+                        t["trailing_on"] = True
+                        if side == "long":
+                            t["sl_price"] = last * (1 - TRAILING_DISTANCE_PCT)
+                        else:
+                            t["sl_price"] = last * (1 + TRAILING_DISTANCE_PCT)
+                        new_trades.append(t)
+                    continue
+
+                # 3) трейлинг уже включён?
+                if t.get("trailing_on"):
+                    if side == "long":
+                        target_sl = last * (1 - TRAILING_DISTANCE_PCT)
+                        if target_sl > t["sl_price"]:
+                            t["sl_price"] = target_sl
+                            try:
+                                await APP.bot.send_message(
+                                    chat_id,
+                                    f"📊 Trailing: подтянул SL по {sym} → {t['sl_price']:.6f}"
+                                )
+                            except Exception as e:
+                                log.warning(f"send trailing msg fail: {e}")
+                    else:
+                        target_sl = last * (1 + TRAILING_DISTANCE_PCT)
+                        if target_sl < t["sl_price"]:
+                            t["sl_price"] = target_sl
+                            try:
+                                await APP.bot.send_message(
+                                    chat_id,
+                                    f"📊 Trailing: подтянул SL по {sym} → {t['sl_price']:.6f}"
+                                )
+                            except Exception as e:
+                                log.warning(f"send trailing msg fail: {e}")
+
+                    new_trades.append(t)
+                    continue
+
+                # 4) если прибыль >= 3% — включаем трейлинг
+                if pnl_pct >= TRAILING_ACTIVATION_PCT:
+                    t["trailing_on"] = True
+                    if side == "long":
+                        t["sl_price"] = last * (1 - TRAILING_DISTANCE_PCT)
+                    else:
+                        t["sl_price"] = last * (1 + TRAILING_DISTANCE_PCT)
+                    try:
+                        await APP.bot.send_message(
+                            chat_id,
+                            f"📈 Trailing включён по {sym}. SL → {t['sl_price']:.6f}"
+                        )
+                    except Exception as e:
+                        log.warning(f"send trailing-on msg fail: {e}")
+                    new_trades.append(t)
+                    continue
+
+                # иначе оставляем
+                new_trades.append(t)
+
+            ACTIVE_TRADES[chat_id] = new_trades
+
+        await asyncio.sleep(15)
+
+# =====================================================
+# MAIN
+# =====================================================
 async def main():
+    global APP
     print("🚀 MAIN INIT START", flush=True)
-    app = Application.builder().token(TG_BOT_TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(TG_BOT_TOKEN).concurrent_updates(True).build()
+    APP = app  # сохранили глобально для trailing_monitor
     print("✅ Application initialized", flush=True)
 
     app.add_handler(CommandHandler("start", start))
@@ -1026,15 +1086,13 @@ async def main():
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
-
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    log.info("UNIFIED FUTURES BOT v2.5.1 STARTED")
+    log.info("UNIFIED FUTURES BOT v2.5.4 SAFE STARTED")
     print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
 
-    # фоновые задачи
     asyncio.create_task(auto_scan_loop(app))
-    asyncio.create_task(trailing_monitor(app))
+    asyncio.create_task(trailing_monitor())
 
     await app.run_polling(drop_pending_updates=True)
 
