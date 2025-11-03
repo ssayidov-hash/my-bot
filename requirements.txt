@@ -3,4 +3,6 @@ pandas
 numpy
 python-telegram-bot>=21.0
 nest_asyncio
-pip install "python-telegram-bot[webhooks]"
+python-telegram-bot[webhooks]==21.6
+
+
