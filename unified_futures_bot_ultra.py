@@ -71,17 +71,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 if not TG_BOT_TOKEN:
     raise SystemExit("❌ Нет TG_BOT_TOKEN")
 
-def ensure_single_instance(token: str):
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=5)
-        j = r.json()
-        if j.get("ok") and j.get("result", {}).get("url"):
-            print("⚠️ Уже есть активный инстанс (webhook). Выходим.")
-            sys.exit(0)
-    except Exception:
-        pass
-
-ensure_single_instance(TG_BOT_TOKEN)
+# ensure_single_instance(TG_BOT_TOKEN) - для вебхука не нужно
 
 # чтобы telegram+asyncio в 3.13 не ругался
 nest_asyncio.apply()
@@ -126,8 +116,9 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 
 LOG_FILENAME = os.path.join(
     LOGS_DIR,
-    f"{datetime.now(dt.timezone.utc).date().isoformat()}_futures_2_5_8.log"
+    f"{datetime.now(dt.timezone.utc).date().isoformat()}_futures_2_6_0.log"
 )
+log = logging.getLogger("FUTURES_2_6_0")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,6 +129,18 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("FUTURES_2_5_8")
+
+# =====================================================
+# WEBHOOK
+# =====================================================
+PORT = int(os.getenv("PORT", "10000"))
+EXTERNAL_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+if not EXTERNAL_URL:
+    raise SystemExit("❌ Нет WEBHOOK_URL/RENDER_EXTERNAL_URL (публичный https)")
+
+WEBHOOK_PATH = f"/{TG_BOT_TOKEN}"   # уникальный путь
+WEBHOOK_URL  = f"{EXTERNAL_URL.rstrip('/')}{WEBHOOK_PATH}"
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "") or None
 
 # =====================================================
 # ГЛОБАЛЫ
@@ -446,7 +449,9 @@ async def scan_exchange(name: str, debug_chats: Set[int] = None, bot=None):
                 results.append(d)
         except Exception as e:
             log.warning(f"{name} {s}: {e}")
-       # отправим прогресс, если кто-то в дебаге
+        # отправим прогресс, если кто-то в дебаге
+
+
     if debug_chats and bot:
         txt = f"🔎 {name.upper()}: {idx}/{total}… сигналы={len(results)}"
         for cid in list(debug_chats):  # ← копия множества
@@ -814,43 +819,37 @@ async def scanlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================
 # ФОН: АВТО-СКАН
 # =====================================================
+import aiohttp
+
 async def auto_scan_loop(app: Application):
     global LAST_NO_SIGNAL_TIME
     while True:
         if AUTO_ENABLED:
             try:
-                # в авто-скан берём все чаты, где включён дебаг
                 entries = await scan_all(SCAN_DEBUG_CHATS if SCAN_DEBUG_CHATS else None, app.bot)
                 now = time.time()
-                if entries:
-                    LAST_NO_SIGNAL_TIME = now
-                    for chat_id in LAST_SCAN.keys() or SCAN_DEBUG_CHATS or []:
-                        d = entries[0]
-                        txt = (
-                            f"📊 Автосигнал:\n"
-                            f"[{d['exchange'].upper()}] {d['side'].upper()} {d['symbol']} {signal_strength_tag(d['prob'])} ({d['prob']}%)\n"
-                            f"Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']}м"
-                        )
-                        LAST_SCAN[chat_id] = [d]
-                        await app.bot.send_message(chat_id, txt, reply_markup=build_signal_keyboard(0))
-                else:
-                    if now - LAST_NO_SIGNAL_TIME >= NO_SIGNAL_NOTIFY_INTERVAL:
-                        for chat_id in LAST_SCAN.keys():
-                            await app.bot.send_message(chat_id, "Сигналов пока нет.")
-                        LAST_NO_SIGNAL_TIME = now
+                ...
+                # Пинг Render
+                async with aiohttp.ClientSession() as s:
+                    try:
+                        await s.get(EXTERNAL_URL, timeout=3)
+                    except Exception:
+                        pass
                 log.info("auto_scan tick OK")
             except Exception as e:
                 log.error(f"auto_scan_loop: {e}")
         await asyncio.sleep(SCAN_INTERVAL)
 
+
 # =====================================================
 # MAIN
 # =====================================================
 async def main():
-    print("MAIN INIT START", flush=True)
+    print("🚀 MAIN INIT START (webhook)", flush=True)
     app = Application.builder().token(TG_BOT_TOKEN).concurrent_updates(True).build()
-    print("Application initialized", flush=True)
-    
+    print("✅ Application initialized", flush=True)
+
+    # === Хендлеры ===
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("scan", scan_cmd))
@@ -861,13 +860,25 @@ async def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("scanlog", scanlog_cmd))
     app.add_handler(CallbackQueryHandler(button_cb))
-    
-    log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED")
-    print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
-    
-    asyncio.create_task(auto_scan_loop(app))
-    await app.run_polling(drop_pending_updates=True)
 
+    # === Фоновая задача (авто-скан) ===
+    asyncio.create_task(auto_scan_loop(app))
+
+    log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED (webhook)")
+    print(f"🌐 Webhook URL: {WEBHOOK_URL}", flush=True)
+    print(f"🔒 Secret set: {'yes' if WEBHOOK_SECRET else 'no'}", flush=True)
+
+    # === Запуск webhook ===
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
+
