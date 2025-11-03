@@ -847,10 +847,10 @@ async def auto_scan_loop(app: Application):
 # MAIN
 # =====================================================
 async def main():
-    print("🚀 MAIN INIT START", flush=True)
+    print("MAIN INIT START", flush=True)
     app = Application.builder().token(TG_BOT_TOKEN).concurrent_updates(True).build()
-    print("✅ Application initialized", flush=True)
-
+    print("Application initialized", flush=True)
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("scan", scan_cmd))
@@ -861,13 +861,13 @@ async def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("scanlog", scanlog_cmd))
     app.add_handler(CallbackQueryHandler(button_cb))
-
-   log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED")
+    
+    log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED")
     print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
-
+    
     asyncio.create_task(auto_scan_loop(app))
-
     await app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
