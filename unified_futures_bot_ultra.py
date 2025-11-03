@@ -400,7 +400,6 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
         "net_tp1_pct": net_tp1_pct,
     }
 
-
 async def scan_exchange(name: str, debug_chats: Set[int] = None, bot=None):
     ex = make_exchange(name)
     syms = await asyncio.to_thread(load_top_usdt_swaps, ex, 60)
