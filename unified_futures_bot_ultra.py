@@ -291,9 +291,11 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
     ohlcv = await asyncio.to_thread(ex.fetch_ohlcv, symbol, TIMEFRAME, None, LIMIT)
     if len(ohlcv) < LIMIT // 2:
         return None
+
     df = pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"])
     c, v = df["c"], df["v"]
 
+    # === индикаторы ===
     r = rsi(c, RSI_PERIOD)
     e50, e200 = ema(c, EMA_SHORT), ema(c, EMA_LONG)
     vma = v.rolling(VOL_SMA).mean()
@@ -304,10 +306,27 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
     open_, close = float(df["o"].iloc[-1]), float(df["c"].iloc[-1])
     bull = close > open_ * 1.003
     bear = close < open_ * 0.997
+    change_pct = (close / open_ - 1) * 100
 
-    h1_trend = await fetch_trend(ex, symbol, "1h", H1_TRENDS_CACHE)
-    h4_trend = await fetch_trend(ex, symbol, "4h", H4_TRENDS_CACHE)
+    # === тренды без кеша ===
+    h1_trend = await fetch_trend(ex, symbol, "1h", H1_TRENDS_CACHE, ttl=0)
+    h4_trend = await fetch_trend(ex, symbol, "4h", H4_TRENDS_CACHE, ttl=0)
 
+    # === анти-памп фильтр ===
+    if change_pct > 6 and volr > 3:
+        msg = f"🚫 {symbol}: памп {change_pct:.1f}% + volr {volr:.2f} → пропуск"
+        log.info(msg)
+        # если включён debug-режим, показать в Telegram
+        for cid in list(SCAN_DEBUG_CHATS):
+            try:
+                from telegram import Bot
+                bot = Bot(TG_BOT_TOKEN)
+                await bot.send_message(cid, msg)
+            except Exception:
+                pass
+        return None
+
+    # === логика сигналов ===
     sh, lo = 0, 0
     if r.iloc[-1] >= RSI_OVERBOUGHT: sh += 1
     if e50.iloc[-1] < e200.iloc[-1] and c.iloc[-1] < e50.iloc[-1]: sh += 1
@@ -326,6 +345,10 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
 
     trend_ok_long = (lo >= 3 and h1_trend == "up" and h4_trend in ("up","flat"))
     trend_ok_short = (sh >= 3 and h1_trend == "down" and h4_trend in ("down","flat"))
+
+    # не шортим против ап-тренда
+    if h1_trend == "up" or h4_trend == "up":
+        trend_ok_short = False
 
     tp1_pct = max(0.02, TP1_MULTIPLIER_TREND * atr_val / close)
     tp2_pct = max(0.04, TP2_MULTIPLIER_TREND * atr_val / close)
@@ -376,6 +399,7 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
         "note": "Near S" if nearS else "Near R" if nearR else "",
         "net_tp1_pct": net_tp1_pct,
     }
+
 
 async def scan_exchange(name: str, debug_chats: Set[int] = None, bot=None):
     ex = make_exchange(name)
