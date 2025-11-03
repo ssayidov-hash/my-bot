@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-# -*- coding: utf-8 -*-
-"""
 UNIFIED FUTURES BOT v2.6.0 SAFE+
 MEXC + BITGET | 15m | объём >= 5M | RSI/EMA/SR/ATR/VOLR | анти-памп фильтр | авто-скан | scanlog
 
@@ -35,8 +33,6 @@ MEXC + BITGET | 15m | объём >= 5M | RSI/EMA/SR/ATR/VOLR | анти-памп
 /history — выгрузить журнал сделок CSV
 /scanlog — включить/выключить debug-режим (пошаговые логи)
 /stop — отключить авто-скан
-"""
-
 """
 
 import os
@@ -321,7 +317,10 @@ def load_top_usdt_swaps(ex: ccxt.Exchange, top_n=60):
         rows.append((s, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in rows[:top_n]]
-
+    
+# =====================================================
+# АНАЛИЗ СИМВОЛОВ (основная логика сигналов)
+# =====================================================
 async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
     ohlcv = await asyncio.to_thread(ex.fetch_ohlcv, symbol, TIMEFRAME, None, LIMIT)
     if len(ohlcv) < LIMIT // 2:
@@ -863,7 +862,7 @@ async def main():
     app.add_handler(CommandHandler("scanlog", scanlog_cmd))
     app.add_handler(CallbackQueryHandler(button_cb))
 
-    log.info("UNIFIED FUTURES BOT v2.5.8 SAFE STARTED")
+   log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED")
     print("BOT ЗАПУЩЕН НА RENDER.COM | 24/7", flush=True)
 
     asyncio.create_task(auto_scan_loop(app))
