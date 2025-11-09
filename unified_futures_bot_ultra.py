@@ -640,8 +640,44 @@ async def handle_buy_from_signal(
         await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] не смог получить баланс: {e}")
         return
 
-    amount = calc_position_amount(bal, d["entry"], stake, LEVERAGE)
-    amount = normalize_amount_for_exchange(ex, d["symbol"], amount)
+    stake = min(stake, bal)
+    entry_price = d["entry"]
+    if entry_price <= 0:
+        await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Некорректная цена входа для {d['symbol']}")
+        return
+
+    if not ex.markets:
+        try:
+            ex.load_markets()
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Не удалось загрузить рынки: {e}")
+            return
+
+    amount = (stake * LEVERAGE) / entry_price
+    try:
+        amount = float(ex.amount_to_precision(d["symbol"], amount))
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Ошибка округления объёма: {e}")
+        return
+
+    market = ex.markets.get(d["symbol"], {}) if ex.markets else {}
+    min_amount = (
+        market.get("limits", {}).get("amount", {}).get("min")
+        if isinstance(market, dict)
+        else None
+    )
+    if min_amount:
+        try:
+            min_amount = float(min_amount)
+        except Exception:
+            min_amount = None
+    if min_amount and amount < min_amount:
+        await context.bot.send_message(
+            chat_id,
+            f"[{d['exchange'].upper()}] Сумма позиции ниже минимальной для {d['symbol']} ({min_amount})",
+        )
+        return
+
     if amount <= 0:
         await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Слишком маленькая сумма для {d['symbol']}")
         return
