@@ -495,6 +495,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
+
+async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("✅ Я проснулся")
+
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "*UNIFIED FUTURES BOT v2.6.0 SAFE+ — справка*\n\n"
@@ -864,6 +869,7 @@ async def main():
     # === Хендлеры ===
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("trade", trade_cmd))
