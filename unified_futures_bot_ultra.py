@@ -8,7 +8,7 @@ MEXC + BITGET | 15m | объём >= 5M | RSI/EMA/SR/ATR/VOLR | анти-памп
 • Таймфрейм: 15 минут
 • Мин. объём: 5M USDT
 • RSI, EMA50/200, ATR, S/R, всплеск объёма (VOLR)
-• Проверка тренда H1 и H4 (без кэша)
+• Проверка тренда H1 и H4 (кэш 30 минут)
 • Анти-памп фильтр: свеча > +6% и volr > 3 → пропуск
 • Не шортит против ап-тренда
 • TP1 ≈ 2×ATR, TP2 ≈ 4×ATR, SL ≈ 1.5×ATR или ≥5%
@@ -29,8 +29,6 @@ MEXC + BITGET | 15m | объём >= 5M | RSI/EMA/SR/ATR/VOLR | анти-памп
 /scan — ручной поиск сигналов (топ-15)
 /top — топ-3 сильных сигналов
 /trade <№> <сумма> — открыть по сигналу
-/report — показать активные сделки
-/history — выгрузить журнал сделок CSV
 /scanlog — включить/выключить debug-режим (пошаговые логи)
 /stop — отключить авто-скан
 """
@@ -39,7 +37,7 @@ import os
 import sys
 import time
 import asyncio
-import logging
+import gc
 from datetime import datetime
 import datetime as dt
 from typing import Dict, List, Tuple, Any, Set
@@ -55,7 +53,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
 )
 from telegram.ext import (
     Application,
@@ -110,25 +107,7 @@ TAKER_FEE = 0.0006
 MAKER_FEE = 0.0002
 
 DATA_DIR = "./data"
-LOGS_DIR = "./logs"
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
-
-LOG_FILENAME = os.path.join(
-    LOGS_DIR,
-    f"{datetime.now(dt.timezone.utc).date().isoformat()}_futures_2_6_0.log"
-)
-log = logging.getLogger("FUTURES_2_6_0")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("FUTURES_2_5_8")
 
 # =====================================================
 # WEBHOOK
@@ -295,9 +274,8 @@ def ensure_bitget_isolated(ex: ccxt.Exchange, symbol: str):
             "productType": "USDT-FUTURES",
             "marginCoin": "USDT",
         })
-        log.info(f"bitget: set isolated for {symbol}")
     except Exception as e:
-        log.warning(f"bitget: cannot set isolated for {symbol}: {e}")
+        _ = e
 
 # =====================================================
 # СКАН
@@ -346,13 +324,12 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
     change_pct = (close / open_ - 1) * 100
 
     # === тренды без кеша ===
-    h1_trend = await fetch_trend(ex, symbol, "1h", H1_TRENDS_CACHE, ttl=0)
-    h4_trend = await fetch_trend(ex, symbol, "4h", H4_TRENDS_CACHE, ttl=0)
+    h1_trend = await fetch_trend(ex, symbol, "1h", H1_TRENDS_CACHE, ttl=1800)
+    h4_trend = await fetch_trend(ex, symbol, "4h", H4_TRENDS_CACHE, ttl=1800)
 
     # === анти-памп фильтр ===
     if change_pct > 6 and volr > 3:
         msg = f"🚫 {symbol}: памп {change_pct:.1f}% + volr {volr:.2f} → пропуск"
-        log.info(msg)
         # если включён debug-режим, показать в Telegram
         for cid in list(SCAN_DEBUG_CHATS):
             try:
@@ -439,24 +416,25 @@ async def analyze_symbol(ex: ccxt.Exchange, symbol: str):
 
 async def scan_exchange(name: str, debug_chats: Set[int] = None, bot=None):
     ex = make_exchange(name)
-    syms = await asyncio.to_thread(load_top_usdt_swaps, ex, 60)
+    syms = await asyncio.to_thread(load_top_usdt_swaps, ex, 25)
     results = []
     total = len(syms)
     for idx, s in enumerate(syms, 1):
+        d = None
         try:
             d = await analyze_symbol(ex, s)
             if d:
                 results.append(d)
-        except Exception as e:
-            log.warning(f"{name} {s}: {e}")
-        # отправим прогресс, если кто-то в дебаге
-
-
-    if debug_chats and bot:
-        txt = f"🔎 {name.upper()}: {idx}/{total}… сигналы={len(results)}"
-        for cid in list(debug_chats):  # ← копия множества
-            await bot.send_message(cid, txt)
-        await asyncio.sleep(0.35)
+        except Exception:
+            pass
+        if debug_chats and bot:
+            txt = f"🔎 {name.upper()}: {idx}/{total}… сигналы={len(results)}"
+            for cid in list(debug_chats):  # ← копия множества
+                await bot.send_message(cid, txt)
+            await asyncio.sleep(0.35)
+        del d
+        del s
+        gc.collect()
 
     results.sort(key=lambda x: (x["prob"], x["volr"]), reverse=True)
     return results
@@ -510,8 +488,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Команды:\n"
         "/scan — найти сигналы\n"
         "/top — топ-3 сильных\n"
-        "/report — активные сделки\n"
-        "/history — журнал сделок\n"
         "/info — описание логики\n"
         "/scanlog — включить/выключить debug-режим\n"
         "/stop — выключить авто\n\n"
@@ -526,7 +502,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• сканирует фьючерсы USDT на MEXC и Bitget\n"
         "• фильтрует пары с объёмом ≥ 5M USDT\n"
         "• проверяет RSI, EMA50/200, всплеск объёма, уровни S/R\n"
-        "• сверяет тренды H1 и H4 (без кэша)\n"
+        "• сверяет тренды H1 и H4 (кэш 30 минут)\n"
         "• считает TP1/TP2, SL, ETA и net-прибыль\n"
         "• исключает пампы: свеча > +6% и volr > 3 → пропуск\n"
         "• не шортит против ап-тренда\n\n"
@@ -602,8 +578,7 @@ def place_orders_real(ex: ccxt.Exchange, d: Dict[str, Any], amount: float):
             "triggerPrice": sl_price,
         })
         placed_tp_sl = True
-    except Exception as e:
-        log.warning(f"{ex.id} cannot place TP/SL: {e}")
+    except Exception:
         placed_tp_sl = False
 
     return placed_tp_sl
@@ -687,7 +662,6 @@ async def handle_buy_from_signal(
         placed_tp_sl = place_orders_real(ex, d, amount)
     except Exception as e:
         await context.bot.send_message(chat_id, f"[{d['exchange'].upper()}] Ошибка ордера: {e}")
-        log.error(f"order error: {e}")
         return
 
     ACTIVE_TRADES.setdefault(chat_id, []).append({
@@ -815,29 +789,6 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await handle_buy_from_signal(update, context, chat_id, idx, stake)
 
-async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    trades = ACTIVE_TRADES.get(chat_id, [])
-    if not trades:
-        await update.effective_message.reply_text("Нет активных сделок.")
-        return
-    lines = ["Активные сделки:"]
-    for i, t in enumerate(trades, 1):
-        lines.append(
-            f"{i}. [{t['exchange'].upper()}] {t['side'].upper()} {t['symbol']} @ {t['entry']:.6f} | TP1 {t['tp1_price']:.6f}"
-        )
-    await update.effective_message.reply_text("\n".join(lines))
-
-async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(TRADES_HISTORY_FILE):
-        await update.effective_message.reply_text("История пуста.")
-        return
-    await update.effective_message.reply_document(
-        document=InputFile(TRADES_HISTORY_FILE),
-        filename="trades_history.csv",
-        caption="Журнал сделок",
-    )
-
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_ENABLED
     AUTO_ENABLED = False
@@ -871,9 +822,8 @@ async def auto_scan_loop(app: Application):
                         await s.get(EXTERNAL_URL, timeout=3)
                     except Exception:
                         pass
-                log.info("auto_scan tick OK")
-            except Exception as e:
-                log.error(f"auto_scan_loop: {e}")
+            except Exception:
+                pass
         await asyncio.sleep(SCAN_INTERVAL)
 
 
@@ -891,8 +841,6 @@ async def main():
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("trade", trade_cmd))
-    app.add_handler(CommandHandler("report", report_cmd))
-    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("scanlog", scanlog_cmd))
     app.add_handler(CallbackQueryHandler(button_cb))
@@ -900,7 +848,6 @@ async def main():
     # === Фоновая задача (авто-скан) ===
     asyncio.create_task(auto_scan_loop(app))
 
-    log.info("UNIFIED FUTURES BOT v2.6.0 SAFE+ STARTED (webhook)")
     print(f"🌐 Webhook URL: {WEBHOOK_URL}", flush=True)
     print(f"🔒 Secret set: {'yes' if WEBHOOK_SECRET else 'no'}", flush=True)
 
