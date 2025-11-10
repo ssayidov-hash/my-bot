@@ -743,7 +743,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин"
         )
         log.info(
-            "📤 scan_cmd: отправляю сигнал %s %s (prob=%s)",
+            "\U0001f4e4 scan_cmd: отправляю сигнал %s %s (prob=%s)",
             d["symbol"],
             d["side"],
             d["prob"],
@@ -752,7 +752,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt,
             reply_markup=build_signal_keyboard(i - 1),
         )
-        log.info("✅ scan_cmd: сигнал %s отправлен", d["symbol"])
+        log.info("\U00002705 scan_cmd: сигнал %s отправлен", d["symbol"])
         await asyncio.sleep(0.15)
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -772,7 +772,7 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"    Entry≈{d['entry']:.6f} | SL=−{d['sl_pct']*100:.1f}% | TP1=+{d['tp1_pct']*100:.1f}% | ETA {d['eta_min']} мин"
         )
         log.info(
-            "📤 top_cmd: отправляю сигнал %s %s (prob=%s)",
+            "\U0001f4e4 top_cmd: отправляю сигнал %s %s (prob=%s)",
             d["symbol"],
             d["side"],
             d["prob"],
@@ -781,7 +781,7 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt,
             reply_markup=build_signal_keyboard(i - 1),
         )
-        log.info("✅ top_cmd: сигнал %s отправлен", d["symbol"])
+        log.info("\U00002705 top_cmd: сигнал %s отправлен", d["symbol"])
         await asyncio.sleep(0.15)
 
 async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
